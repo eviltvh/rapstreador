@@ -160,11 +160,12 @@ function transformRow(row) {
     origen: row.origen,
     followed_at: row.followed_at,
     mutual_checked_at: row.mutual_checked_at,
+    unfollowed_at: row.unfollowed_at,
+    last_updated: row.last_updated,
     profile_followers: row.profile_followers != null ? Number(row.profile_followers) : '',
     profile_following: row.profile_following != null ? Number(row.profile_following) : '',
     profile_ratio:     row.profile_ratio     != null ? parseFloat(row.profile_ratio).toFixed(4) : '',
     stand_type: row.stand_type,
-    days_active: row.days_active != null ? Number(row.days_active) : '',
   };
 }
 
