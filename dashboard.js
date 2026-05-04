@@ -40,11 +40,12 @@ function buildGraph(rows) {
         origen: '',
         followed_at: '',
         mutual_checked_at: '',
+        unfollowed_at: '',
+        last_updated: '',
         profile_followers: '',
         profile_following: '',
         profile_ratio: '',
         stand_type: '',
-        days_active: '',
       });
     } else if (!isGhost) {
       nodeMap.get(id).ghost = false;
@@ -62,12 +63,13 @@ function buildGraph(rows) {
       status: (row.status || 'unknown').toLowerCase(),
       mutual: row.mutual === true || String(row.mutual || '').toLowerCase() === 'true',
       mutual_checked_at: row.mutual_checked_at || '',
+      unfollowed_at: row.unfollowed_at || '',
+      last_updated: row.last_updated || '',
       origen: (row.origen || '').trim(),
       profile_followers: row.profile_followers ?? '',
       profile_following: row.profile_following ?? '',
       profile_ratio: row.profile_ratio ?? '',
       stand_type: row.stand_type || '',
-      days_active: row.days_active ?? '',
     });
 
     const o = node.origen;
@@ -377,7 +379,8 @@ function renderNodeInfo() {
     html += `<dt>mutual</dt><dd class="${d.mutual?'accent':''}">${d.mutual?'yes':'no'}</dd>`;
     html += `<dt>origen</dt><dd class="pink">${d.origen||'—'}</dd>`;
     if (d.followed_at) html += `<dt>followed</dt><dd>${(d.followed_at||'').slice(0,10)}</dd>`;
-    if (d.days_active !== '' && d.days_active != null) html += `<dt>days</dt><dd>${d.days_active}</dd>`;
+    if (d.unfollowed_at) html += `<dt>unfollowed</dt><dd class="pink">${(d.unfollowed_at||'').slice(0,10)}</dd>`;
+    if (d.last_updated) html += `<dt>updated</dt><dd>${(d.last_updated||'').slice(0,10)}</dd>`;
     if (d.profile_followers) html += `<dt>followers</dt><dd>${d.profile_followers}</dd>`;
     if (d.profile_following) html += `<dt>following</dt><dd>${d.profile_following}</dd>`;
     if (d.profile_ratio) html += `<dt>ratio</dt><dd>${d.profile_ratio}</dd>`;
