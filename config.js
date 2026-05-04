@@ -13,5 +13,5 @@ window.POLPO_NETWORK_CONFIG = {
   TABLE: 'stand_users',
 
   // Columnas que necesita el grafo (mantén el orden si quieres)
-  COLUMNS: 'username,status,mutual,origen,followed_at,mutual_checked_at,profile_followers,profile_following,profile_ratio,stand_type'
+ COLUMNS: 'username,status,mutual,origen,followed_at,mutual_checked_at,profile_followers,profile_following,profile_ratio,stand_type,unfollowed_at,last_updated'
 };
