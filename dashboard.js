@@ -8,6 +8,13 @@
 
 "use strict";
 
+// ─── DEAD BRANCH CONFIG ──────────────────────────────────
+// status que cuentan como "muertos" base. luego se propaga hacia arriba:
+// si un nodo no-mutual tiene TODOS sus out-edges apuntando a muertos,
+// también se considera muerto -> rama muerta entera en morado.
+const DEAD_STATUSES = new Set(['inactive', 'request_canceled']);
+const DEAD_COLOR = '#B14DFF';
+
 // ─── STATE ───────────────────────────────────────────────
 const state = {
   nodes: [],
@@ -16,6 +23,7 @@ const state = {
   adj: new Map(),
   outAdj: new Map(),
   inAdj: new Map(),
+  deadSet: new Set(),
   filter: 'all',
   selectedId: null,
   pathIds: new Set(),
@@ -112,6 +120,39 @@ function indexGraph(nodes, links) {
   return { adj, outAdj, inAdj, nodeMap };
 }
 
+// ─── DEAD SET COMPUTATION ────────────────────────────────
+// 1) marca como muertos los que tienen status ∈ DEAD_STATUSES
+// 2) propaga: cualquier nodo no-mutual cuyos out-edges TODOS son muertos,
+//    también es muerto. itera hasta estabilizar (fixed-point).
+// los mutuals nunca se marcan muertos -> el origen amarillo se respeta.
+// los ghosts (origenes puros) sí pueden marcarse si toda su descendencia es muerta.
+function computeDeadSet() {
+  const dead = new Set();
+
+  // base
+  state.nodes.forEach(n => {
+    if (!n.mutual && DEAD_STATUSES.has((n.status || '').toLowerCase())) {
+      dead.add(n.id);
+    }
+  });
+
+  // propagation
+  let changed = true;
+  while (changed) {
+    changed = false;
+    state.nodes.forEach(n => {
+      if (dead.has(n.id) || n.mutual) return;
+      const outs = state.outAdj.get(n.id);
+      if (!outs || outs.size === 0) return; // hojas no propagan
+      let allDead = true;
+      outs.forEach(c => { if (!dead.has(c)) allDead = false; });
+      if (allDead) { dead.add(n.id); changed = true; }
+    });
+  }
+
+  return dead;
+}
+
 function connectedComponents(nodes, adj) {
   const seen = new Set();
   let count = 0;
@@ -172,6 +213,7 @@ function initSvg() {
   mk('arrow', '#444');
   mk('arrow-hl', '#E8FF00');
   mk('arrow-path', '#FF00B3');
+  mk('arrow-dead', DEAD_COLOR);
 
   gZoom = svg.append('g').attr('class', 'zoom-layer');
   gLinks = gZoom.append('g').attr('class', 'links');
@@ -189,6 +231,10 @@ function destroySimulation() {
 }
 
 function nodeColor(d) {
+  // dead tiene prioridad sobre todo excepto mutual (el deadSet ya excluye mutuals)
+  if (state.deadSet.has(d.id)) {
+    return d.ghost ? 'transparent' : DEAD_COLOR;
+  }
   if (d.ghost) return 'transparent';
   if (d.mutual) return '#E8FF00';
   if (d.status === 'unfollowed') return '#444';
@@ -196,6 +242,7 @@ function nodeColor(d) {
   return '#f5f5f5';
 }
 function nodeStroke(d) {
+  if (state.deadSet.has(d.id)) return DEAD_COLOR;
   if (d.ghost) return '#666';
   if (d.mutual) return '#E8FF00';
   if (d.status === 'unfollowed') return '#444';
@@ -206,6 +253,12 @@ function nodeRadius(d) {
   return Math.min(12, 4 + Math.sqrt(deg) * 1.5);
 }
 
+// helper: el link entra a una rama muerta si su target está en deadSet
+function linkIsDead(d) {
+  const t = d.target.id || d.target;
+  return state.deadSet.has(t);
+}
+
 function render() {
   const { width, height } = svg.node().getBoundingClientRect();
 
@@ -213,9 +266,13 @@ function render() {
     .data(state.links, d => `${(d.source.id||d.source)}|${(d.target.id||d.target)}`);
   linkSel.exit().remove();
   const linkEnter = linkSel.enter().append('line')
-    .attr('class', 'link')
-    .attr('marker-end', 'url(#arrow)');
+    .attr('class', 'link');
   const allLinks = linkEnter.merge(linkSel);
+
+  // pinta links muertos en morado tenue
+  allLinks
+    .style('stroke', d => linkIsDead(d) ? DEAD_COLOR : null)
+    .style('stroke-opacity', d => linkIsDead(d) ? 0.5 : null);
 
   const nodeSel = gNodes.selectAll('g.node').data(state.nodes, d => d.id);
   nodeSel.exit().remove();
@@ -279,6 +336,7 @@ function applyHighlights() {
       else if (filter === 'active' && d.status !== 'active') dim = true;
       else if (filter === 'unfollowed' && d.status !== 'unfollowed') dim = true;
       else if (filter === 'origin' && !d.ghost && state.outAdj.get(d.id)?.size === 0) dim = true;
+      else if (filter === 'dead' && !state.deadSet.has(d.id)) dim = true;
     }
     if (search && !d.id.toLowerCase().includes(search)) dim = true;
 
@@ -326,7 +384,14 @@ function applyHighlights() {
     el.classed('dim', dim);
     el.classed('highlight', highlight && !inPath);
     el.classed('path', inPath);
-    el.attr('marker-end', inPath ? 'url(#arrow-path)' : (highlight ? 'url(#arrow-hl)' : 'url(#arrow)'));
+
+    // marker priority: path > highlight > dead > default
+    const isDead = state.deadSet.has(tId);
+    let marker = 'url(#arrow)';
+    if (inPath) marker = 'url(#arrow-path)';
+    else if (highlight) marker = 'url(#arrow-hl)';
+    else if (isDead) marker = 'url(#arrow-dead)';
+    el.attr('marker-end', marker);
   });
 }
 
@@ -335,9 +400,10 @@ const tooltipEl = document.getElementById('tooltip');
 function showTooltip(e, d) {
   const inDeg = state.inAdj.get(d.id)?.size || 0;
   const outDeg = state.outAdj.get(d.id)?.size || 0;
+  const deadTag = state.deadSet.has(d.id) ? ' · dead' : '';
   tooltipEl.innerHTML = `
     <div class="tooltip-name">@${d.id}</div>
-    <div>${d.ghost ? '[ origin only ]' : (d.status || '—')}${d.mutual ? ' · mutual' : ''}</div>
+    <div>${d.ghost ? '[ origin only ]' : (d.status || '—')}${d.mutual ? ' · mutual' : ''}${deadTag}</div>
     <div style="color:var(--muted);margin-top:2px;">in ${inDeg} · out ${outDeg}</div>
   `;
   tooltipEl.classList.add('show');
@@ -367,9 +433,13 @@ function renderNodeInfo() {
 
   const ins = Array.from(state.inAdj.get(d.id) || []);
   const outs = Array.from(state.outAdj.get(d.id) || []);
+  const isDead = state.deadSet.has(d.id);
 
   let html = `<div class="node-info-name">${d.id}</div>`;
   html += '<dl>';
+  if (isDead) {
+    html += `<dt>branch</dt><dd style="color:${DEAD_COLOR};">dead</dd>`;
+  }
   if (d.ghost) {
     html += `<dt>type</dt><dd class="accent">origin only</dd>`;
     html += `<dt>incoming</dt><dd>${ins.length}</dd>`;
@@ -424,11 +494,14 @@ function runSearch() {
     if (filter === 'active') return n.status === 'active';
     if (filter === 'unfollowed') return n.status === 'unfollowed';
     if (filter === 'origin') return n.ghost || (state.outAdj.get(n.id)?.size > 0);
+    if (filter === 'dead') return state.deadSet.has(n.id);
     return true;
   }).slice(0, 50);
 
   box.innerHTML = matches.map(n => {
-    const tag = n.ghost ? 'origin' : (n.mutual ? 'mutual' : (n.status||'—'));
+    const tag = state.deadSet.has(n.id) ? 'dead'
+      : n.ghost ? 'origin'
+      : (n.mutual ? 'mutual' : (n.status||'—'));
     return `<div class="search-result" data-id="${n.id}">
       <span>@${n.id}</span><span class="badge">${tag}</span>
     </div>`;
@@ -521,6 +594,10 @@ function renderStats() {
   document.getElementById('statComponents').textContent = connectedComponents(state.nodes, state.adj);
   const avgDeg = state.nodes.length ? (2 * state.links.length / state.nodes.length).toFixed(2) : 0;
   document.getElementById('statDegree').textContent = avgDeg;
+
+  // Dead stat (opcional, solo si existe el elemento en el HTML)
+  const statDead = document.getElementById('statDead');
+  if (statDead) statDead.textContent = state.deadSet.size;
 }
 
 // ─── DASHBOARD UI WIRING (toolbar + filters + search) ────
@@ -603,6 +680,7 @@ function buildDashboard(rows) {
   state.outAdj = idx.outAdj;
   state.inAdj = idx.inAdj;
   state.nodeMap = idx.nodeMap;
+  state.deadSet = computeDeadSet();
   state.selectedId = null;
   state.pathIds = new Set();
   state.pathOrdered = [];
@@ -626,6 +704,7 @@ function destroyDashboard() {
   state.outAdj = new Map();
   state.inAdj = new Map();
   state.nodeMap = new Map();
+  state.deadSet = new Set();
   state.selectedId = null;
   state.pathIds = new Set();
   state.pathOrdered = [];
