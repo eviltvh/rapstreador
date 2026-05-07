@@ -8,12 +8,18 @@
 
 "use strict";
 
-// ─── DEAD BRANCH CONFIG ──────────────────────────────────
-// status que cuentan como "muertos" base. luego se propaga hacia arriba:
-// si un nodo no-mutual tiene TODOS sus out-edges apuntando a muertos,
-// también se considera muerto -> rama muerta entera en morado.
-const DEAD_STATUSES = new Set(['inactive', 'request_canceled']);
+// ─── DEAD FAMILY CONFIG ──────────────────────────────────
+// Un nodo está VIVO si: status === 'active'  OR  mutual === true.
+// Una FAMILIA MUERTA es un sub-árbol donde NINGÚN descendiente está vivo.
+// En ese caso pintamos en morado a todos los descendientes (y al origen
+// si tampoco está vivo). Si en cualquier rama aparece un vivo, esa
+// familia se respeta y nadie se pinta morado.
 const DEAD_COLOR = '#B14DFF';
+
+function isAlive(n) {
+  if (!n) return false;
+  return n.status === 'active' || n.mutual === true;
+}
 
 // ─── STATE ───────────────────────────────────────────────
 const state = {
@@ -97,7 +103,7 @@ function buildGraph(rows) {
   return { nodes: Array.from(nodeMap.values()), links: dedup };
 }
 
-// ─── ADJACENCY + STATS ───────────────────────────────────
+// ─── ADJACENCY ───────────────────────────────────────────
 function indexGraph(nodes, links) {
   const adj = new Map();
   const outAdj = new Map();
@@ -120,35 +126,50 @@ function indexGraph(nodes, links) {
   return { adj, outAdj, inAdj, nodeMap };
 }
 
-// ─── DEAD SET COMPUTATION ────────────────────────────────
-// 1) marca como muertos los que tienen status ∈ DEAD_STATUSES
-// 2) propaga: cualquier nodo no-mutual cuyos out-edges TODOS son muertos,
-//    también es muerto. itera hasta estabilizar (fixed-point).
-// los mutuals nunca se marcan muertos -> el origen amarillo se respeta.
-// los ghosts (origenes puros) sí pueden marcarse si toda su descendencia es muerta.
-function computeDeadSet() {
+// ─── DEAD FAMILY DETECTION ───────────────────────────────
+// Para cada nodo con descendientes, hago BFS de TODA su descendencia
+// recursiva. Si ni un solo descendiente está vivo → familia muerta:
+// marco a todos los descendientes como dead, y al padre también si
+// no está vivo. Si el padre es mutual (yocee_crzz por ej.), se queda
+// con su color original aunque su familia haya muerto.
+//
+// Casos cubiertos:
+//   - Familia 100% muerta colgando de un mutual → solo descendientes en morado
+//   - Sub-rama muerta dentro de un árbol mixto → solo esa sub-rama en morado
+//   - Hoja inactive/request_canceled aislada con hermanos vivos → NO se pinta
+function getAllDescendants(nodeId, outAdj) {
+  const desc = new Set();
+  const queue = [];
+  const start = outAdj.get(nodeId);
+  if (start) start.forEach(c => queue.push(c));
+  while (queue.length) {
+    const x = queue.shift();
+    if (desc.has(x)) continue;
+    desc.add(x);
+    const children = outAdj.get(x);
+    if (children) children.forEach(c => { if (!desc.has(c)) queue.push(c); });
+  }
+  return desc;
+}
+
+function computeDeadFamilies() {
   const dead = new Set();
 
-  // base
   state.nodes.forEach(n => {
-    if (!n.mutual && DEAD_STATUSES.has((n.status || '').toLowerCase())) {
-      dead.add(n.id);
+    const descendants = getAllDescendants(n.id, state.outAdj);
+    if (descendants.size === 0) return; // hojas no son "familia"
+
+    let anyAlive = false;
+    for (const dId of descendants) {
+      const node = state.nodeMap.get(dId);
+      if (isAlive(node)) { anyAlive = true; break; }
+    }
+
+    if (!anyAlive) {
+      descendants.forEach(d => dead.add(d));
+      if (!isAlive(n)) dead.add(n.id);
     }
   });
-
-  // propagation
-  let changed = true;
-  while (changed) {
-    changed = false;
-    state.nodes.forEach(n => {
-      if (dead.has(n.id) || n.mutual) return;
-      const outs = state.outAdj.get(n.id);
-      if (!outs || outs.size === 0) return; // hojas no propagan
-      let allDead = true;
-      outs.forEach(c => { if (!dead.has(c)) allDead = false; });
-      if (allDead) { dead.add(n.id); changed = true; }
-    });
-  }
 
   return dead;
 }
@@ -231,7 +252,6 @@ function destroySimulation() {
 }
 
 function nodeColor(d) {
-  // dead tiene prioridad sobre todo excepto mutual (el deadSet ya excluye mutuals)
   if (state.deadSet.has(d.id)) {
     return d.ghost ? 'transparent' : DEAD_COLOR;
   }
@@ -253,10 +273,11 @@ function nodeRadius(d) {
   return Math.min(12, 4 + Math.sqrt(deg) * 1.5);
 }
 
-// helper: el link entra a una rama muerta si su target está en deadSet
+// link 100% interno a familia muerta = ambos extremos en deadSet
 function linkIsDead(d) {
+  const s = d.source.id || d.source;
   const t = d.target.id || d.target;
-  return state.deadSet.has(t);
+  return state.deadSet.has(s) && state.deadSet.has(t);
 }
 
 function render() {
@@ -269,7 +290,6 @@ function render() {
     .attr('class', 'link');
   const allLinks = linkEnter.merge(linkSel);
 
-  // pinta links muertos en morado tenue
   allLinks
     .style('stroke', d => linkIsDead(d) ? DEAD_COLOR : null)
     .style('stroke-opacity', d => linkIsDead(d) ? 0.5 : null);
@@ -385,8 +405,7 @@ function applyHighlights() {
     el.classed('highlight', highlight && !inPath);
     el.classed('path', inPath);
 
-    // marker priority: path > highlight > dead > default
-    const isDead = state.deadSet.has(tId);
+    const isDead = state.deadSet.has(sId) && state.deadSet.has(tId);
     let marker = 'url(#arrow)';
     if (inPath) marker = 'url(#arrow-path)';
     else if (highlight) marker = 'url(#arrow-hl)';
@@ -400,7 +419,7 @@ const tooltipEl = document.getElementById('tooltip');
 function showTooltip(e, d) {
   const inDeg = state.inAdj.get(d.id)?.size || 0;
   const outDeg = state.outAdj.get(d.id)?.size || 0;
-  const deadTag = state.deadSet.has(d.id) ? ' · dead' : '';
+  const deadTag = state.deadSet.has(d.id) ? ' · dead family' : '';
   tooltipEl.innerHTML = `
     <div class="tooltip-name">@${d.id}</div>
     <div>${d.ghost ? '[ origin only ]' : (d.status || '—')}${d.mutual ? ' · mutual' : ''}${deadTag}</div>
@@ -438,7 +457,7 @@ function renderNodeInfo() {
   let html = `<div class="node-info-name">${d.id}</div>`;
   html += '<dl>';
   if (isDead) {
-    html += `<dt>branch</dt><dd style="color:${DEAD_COLOR};">dead</dd>`;
+    html += `<dt>family</dt><dd style="color:${DEAD_COLOR};">dead branch</dd>`;
   }
   if (d.ghost) {
     html += `<dt>type</dt><dd class="accent">origin only</dd>`;
@@ -595,21 +614,17 @@ function renderStats() {
   const avgDeg = state.nodes.length ? (2 * state.links.length / state.nodes.length).toFixed(2) : 0;
   document.getElementById('statDegree').textContent = avgDeg;
 
-  // Dead stat (opcional, solo si existe el elemento en el HTML)
   const statDead = document.getElementById('statDead');
   if (statDead) statDead.textContent = state.deadSet.size;
 }
 
-// ─── DASHBOARD UI WIRING (toolbar + filters + search) ────
+// ─── DASHBOARD UI WIRING ─────────────────────────────────
 function wireDashboardUI() {
-  // search
   const searchInput = document.getElementById('searchInput');
   searchInput.removeEventListener?.('input', runSearch);
   searchInput.addEventListener('input', runSearch);
 
-  // filter chips
   document.querySelectorAll('.chip').forEach(c => {
-    // clone to clear listeners on reload
     const clone = c.cloneNode(true);
     c.replaceWith(clone);
   });
@@ -623,7 +638,6 @@ function wireDashboardUI() {
     });
   });
 
-  // path
   const pathBtn = document.getElementById('pathBtn');
   const pathClear = document.getElementById('pathClearBtn');
   const pathFrom = document.getElementById('pathFrom');
@@ -633,7 +647,6 @@ function wireDashboardUI() {
   pathFrom.onkeydown = (e) => { if (e.key === 'Enter') tracePath(); };
   pathTo.onkeydown   = (e) => { if (e.key === 'Enter') tracePath(); };
 
-  // toolbar
   document.getElementById('resetBtn').onclick = () => {
     svg.transition().duration(400).call(zoomBehavior.transform, d3.zoomIdentity);
     if (simulation) simulation.alpha(0.6).restart();
@@ -655,7 +668,6 @@ function wireDashboardUI() {
     gNodes.selectAll('g.node text').style('display', state.showLabels ? null : 'none');
   };
 
-  // resize
   window.onresize = () => {
     if (!simulation) return;
     const { width, height } = svg.node().getBoundingClientRect();
@@ -665,7 +677,6 @@ function wireDashboardUI() {
 }
 
 // ─── ENTRY POINT ─────────────────────────────────────────
-// app.js llama esto pasándole los rows transformados de la DB
 function buildDashboard(rows) {
   const { nodes, links } = buildGraph(rows);
   if (!nodes.length) {
@@ -680,7 +691,7 @@ function buildDashboard(rows) {
   state.outAdj = idx.outAdj;
   state.inAdj = idx.inAdj;
   state.nodeMap = idx.nodeMap;
-  state.deadSet = computeDeadSet();
+  state.deadSet = computeDeadFamilies();
   state.selectedId = null;
   state.pathIds = new Set();
   state.pathOrdered = [];
@@ -695,7 +706,6 @@ function buildDashboard(rows) {
   setTimeout(applyHighlights, 100);
 }
 
-// limpieza para reload (equivalente a destroyAllCharts del playbook)
 function destroyDashboard() {
   destroySimulation();
   state.nodes = [];
@@ -718,5 +728,4 @@ function showToast(msg) {
   setTimeout(() => el.classList.remove('show'), 3500);
 }
 
-// expose para app.js
 window.POLPO_DASHBOARD = { buildDashboard, destroyDashboard, showToast };
