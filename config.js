@@ -1,9 +1,4 @@
-// ─── POLPO NETWORK :: SUPABASE CONFIG ──────────────────────
-// -bynd
-// Reemplaza con tus credenciales del proyecto.
-// La anon key es PÚBLICA por diseño. La seguridad real la dan
-// las RLS policies (ver README).
-// ───────────────────────────────────────────────────────────
+
 
 window.POLPO_NETWORK_CONFIG = {
   SUPABASE_URL: 'https://jlgudpcsgbzqiryuoxam.supabase.co',
@@ -13,5 +8,12 @@ window.POLPO_NETWORK_CONFIG = {
   TABLE: 'stand_users',
 
   // Columnas que necesita el grafo (mantén el orden si quieres)
- COLUMNS: 'username,status,mutual,origen,followed_at,mutual_checked_at,profile_followers,profile_following,profile_ratio,stand_type,unfollowed_at,last_updated'
+  COLUMNS: 'username,status,mutual,origen,followed_at,mutual_checked_at,profile_followers,profile_following,profile_ratio,stand_type,unfollowed_at,last_updated',
+
+  // ey columnas de la migracion v3.1 (si aun no existen se ignoran) -bynd
+  EXTRA_COLUMNS: 'request_state,is_private',
+
+  // aaa tablas de red (opcionales: sin ellas el grafo es solo linaje de origen) -bynd
+  TABLE_FOLLOWED_BY: 'followed_by',
+  TABLE_RED: 'red_perfil'
 };
