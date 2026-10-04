@@ -21,7 +21,7 @@
 <!-- ════════ LOGIN SCREEN ════════ -->
 <div class="login-screen" id="loginScreen">
   <h1>POLPO <em>/ network</em></h1>
-  <div class="subtitle">[ origin → user connection analyzer ]</div>
+  <div class="subtitle">[ who-follows-who · infiltrated network analyzer ]</div>
 
   <div class="login-card">
     <div class="login-card-title">access</div>
@@ -37,7 +37,7 @@
 
   <div class="empty-footer">
     <span>SNCTVM // -bynd</span>
-    <span>POLPO :: NETWORK v2 · supabase</span>
+    <span>POLPO :: NETWORK v3 · supabase</span>
   </div>
 </div>
 
@@ -61,11 +61,13 @@
 
   <div class="stats">
     <div class="stat"><div class="stat-label">Nodes</div><div class="stat-value" id="statNodes">0</div></div>
-    <div class="stat"><div class="stat-label">Edges</div><div class="stat-value" id="statEdges">0</div></div>
+    <div class="stat"><div class="stat-label">Edges</div><div class="stat-value" id="statEdges">0</div><div class="stat-sub" id="statEdgesSub"></div></div>
     <div class="stat"><div class="stat-label">Mutuals</div><div class="stat-value accent" id="statMutuals">0</div></div>
     <div class="stat"><div class="stat-label">Origins</div><div class="stat-value" id="statOrigins">0</div></div>
     <div class="stat"><div class="stat-label">Components</div><div class="stat-value" id="statComponents">0</div></div>
     <div class="stat"><div class="stat-label">Avg Degree</div><div class="stat-value" id="statDegree">0</div></div>
+    <div class="stat"><div class="stat-label">Networks</div><div class="stat-value" id="statNets">0</div></div>
+    <div class="stat"><div class="stat-label">Infiltrated</div><div class="stat-value accent" id="statInfiltrated">0</div></div>
   </div>
 
   <div class="main-grid">
@@ -76,19 +78,44 @@
         <button id="resetBtn">RESET VIEW</button>
         <button id="freezeBtn">FREEZE</button>
         <button id="labelsBtn" class="active">LABELS</button>
+        <span class="toolbar-sep"></span>
+        <button id="followsBtn" class="active">FOLLOWS</button>
+        <button id="origenBtn" class="active">ORIGEN</button>
+        <button id="hullsBtn" class="active">REDES</button>
+        <button id="colorBtn">COLOR: STATUS</button>
       </div>
       <svg class="graph" id="graph"></svg>
       <div class="graph-legend">
         <div class="legend-title">Legend</div>
-        <div class="legend-row"><span class="legend-dot" style="background:var(--node-mutual)"></span>mutual</div>
-        <div class="legend-row"><span class="legend-dot" style="background:var(--node-active)"></span>active</div>
-        <div class="legend-row"><span class="legend-dot" style="background:var(--node-unfollowed)"></span>unfollowed</div>
-        <div class="legend-row"><span class="legend-dot" style="background:var(--bg);border-style:dashed"></span>origin (ghost)</div>
+        <div id="legendStatus">
+          <div class="legend-row"><span class="legend-dot" style="background:var(--node-mutual);border-color:var(--node-mutual)"></span>mutual</div>
+          <div class="legend-row"><span class="legend-dot" style="background:var(--node-active)"></span>active (bot)</div>
+          <div class="legend-row"><span class="legend-dot" style="background:var(--bg)"></span>sigues (fuera del bot)</div>
+          <div class="legend-row"><span class="legend-dot" style="background:var(--bg);border-color:var(--pink)"></span>visto · no lo sigues</div>
+          <div class="legend-row"><span class="legend-dot" style="background:var(--node-unfollowed);border-color:var(--node-unfollowed)"></span>unfollowed</div>
+          <div class="legend-row"><span class="legend-dot" style="background:#B14DFF;border-color:#B14DFF"></span>dead family</div>
+          <div class="legend-row"><span class="legend-dot" style="background:var(--bg);border-style:dashed;border-color:var(--muted)"></span>origin (ghost)</div>
+        </div>
+        <div id="legendNetwork" class="hidden">
+          <div class="legend-row"><span class="legend-dot" style="background:var(--accent);border-color:var(--accent)"></span>red infiltrated</div>
+          <div class="legend-row"><span class="legend-dot" style="background:var(--pink);border-color:var(--pink)"></span>red contact</div>
+          <div class="legend-row"><span class="legend-dot" style="background:var(--muted);border-color:var(--muted)"></span>red cold</div>
+          <div class="legend-row"><span class="legend-dot" style="background:var(--dim);border-color:var(--dim)"></span>suelto</div>
+        </div>
+        <div class="legend-sep"></div>
+        <div class="legend-row"><span class="legend-line"></span>follows (A sigue a B)</div>
+        <div class="legend-row"><span class="legend-line dashed"></span>origen (cacheado desde)</div>
       </div>
     </div>
 
     <!-- ═══ SIDEBAR ═══ -->
     <aside class="sidebar">
+
+      <div class="panel">
+        <div class="panel-title">infiltrated networks</div>
+        <div class="net-summary" id="netSummary"></div>
+        <div class="net-list" id="netList"></div>
+      </div>
 
       <div class="panel">
         <div class="panel-title">search</div>
@@ -98,8 +125,11 @@
             <span class="chip active" data-filter="all">all</span>
             <span class="chip" data-filter="mutual">mutuals</span>
             <span class="chip" data-filter="active">active</span>
+            <span class="chip" data-filter="seen">vistos</span>
+            <span class="chip" data-filter="infiltrated">infiltrated</span>
             <span class="chip" data-filter="unfollowed">unfollowed</span>
             <span class="chip" data-filter="origin">origins</span>
+            <span class="chip" data-filter="dead">dead</span>
           </div>
           <div class="search-results" id="searchResults"></div>
         </div>
