@@ -2,23 +2,58 @@
    POLPO :: NETWORK ANALYZER  ·  dashboard.js
    Toda la lógica de visualización (D3 + grafo + interacción).
    No conoce Supabase: solo recibe rows transformados desde app.js
-   y dibuja. Entry point: buildDashboard(rows).
+   y dibuja. Entry point: buildDashboard(rows, extras).
    -bynd
+
+   v3 · grafo tipo instagram
+   ─────────────────────────
+   Antes el grafo era un árbol origen → user → user (cada nodo
+   tenía UN solo padre: su origen de cacheo). Ahora hay dos tipos
+   de arista y un nodo puede tener varios "padres":
+
+     follows  A ──▶ B   A sigue a B. Sale de la tabla followed_by
+                        (el "Followed by A, C + 3 more" que lee el
+                        bot en el perfil de B). Varios usuarios
+                        convergen en uno, como en instagram.
+     origen   O ┄┄▶ U   U se cacheó desde la lista de O (linaje
+                        del bot). Se sigue usando para dead families.
+
+   Redes infiltradas
+   ─────────────────
+   Sobre el grafo completo (follows pesa más que origen) se corre
+   Louvain → comunidades. Para cada red con ≥ 3 nodos se mide:
+     index = (0.6·mutuals + 0.4·sigues) / tamaño        (0 … 1)
+   y se clasifica:
+     INFILTRATED  ≥ 2 mutuals  y  index ≥ 0.35
+     CONTACT      ≥ 1 mutual   o  index ≥ 0.20
+     COLD         lo demás
+   Cada red se dibuja como un casco (hull) detrás de sus nodos.
    ═══════════════════════════════════════════════════════════ */
 
 "use strict";
 
-// ─── DEAD FAMILY CONFIG ──────────────────────────────────
-// Un nodo está VIVO si: status === 'active'  OR  mutual === true.
-// Una FAMILIA MUERTA es un sub-árbol donde NINGÚN descendiente está vivo.
-// En ese caso pintamos en morado a todos los descendientes (y al origen
-// si tampoco está vivo). Si en cualquier rama aparece un vivo, esa
-// familia se respeta y nadie se pinta morado.
+// ─── CONFIG VISUAL ───────────────────────────────────────
 const DEAD_COLOR = '#B14DFF';
+const TIER = {
+  infiltrated: { label: 'INFILTRATED', color: '#E8FF00' },
+  contact:     { label: 'CONTACT',     color: '#FF00B3' },
+  cold:        { label: 'COLD',        color: '#666666' },
+};
+const MIN_NET_SIZE = 3;                 // redes más chicas = nodos sueltos
+const EDGE_WEIGHT = { follows: 1.0, origen: 0.5 };
+const DEAD_STATUSES = new Set(['unfollowed', 'inactive', 'request_cancelled']);
 
+// Un nodo está VIVO si: status === 'active'  OR  mutual === true.
+// Una FAMILIA MUERTA es un sub-árbol (por aristas de ORIGEN) donde NINGÚN
+// descendiente está vivo. Se pintan en morado los descendientes (y el
+// origen si tampoco está vivo).
 function isAlive(n) {
   if (!n) return false;
   return n.status === 'active' || n.mutual === true;
+}
+// ey "tuyo" = lo sigues (bot o fuera del bot) -bynd
+function isYours(n) {
+  return !!n && (n.mutual || n.status === 'active' || n.kind === 'external');
 }
 
 // ─── STATE ───────────────────────────────────────────────
@@ -26,53 +61,78 @@ const state = {
   nodes: [],
   links: [],
   nodeMap: new Map(),
-  adj: new Map(),
-  outAdj: new Map(),
-  inAdj: new Map(),
+  adj: new Map(),          // no dirigido, todas las aristas (path, componentes)
+  outAdj: new Map(),       // ORIGEN: origen → spawned
+  inAdj: new Map(),        // ORIGEN: spawned ← origen
+  followOut: new Map(),    // FOLLOWS: A sigue a →
+  followIn: new Map(),     // FOLLOWS: lo siguen ←
   deadSet: new Set(),
+  nets: [],                // redes (≥ MIN_NET_SIZE), ordenadas por index
+  netOf: new Map(),        // nodeId → net
+  focusNet: null,
   filter: 'all',
   selectedId: null,
   pathIds: new Set(),
   pathOrdered: [],
   showLabels: true,
+  showOrigen: true,
+  showFollows: true,
+  showHulls: true,
+  colorMode: 'status',     // 'status' | 'network'
   frozen: false,
+  hasFollowData: false,
 };
 
 // ─── BUILD GRAPH FROM ROWS ───────────────────────────────
-function buildGraph(rows) {
+// kind: tracked (stand_users) · seen (perfil evaluado, no lo sigues)
+//       external (lo sigues fuera del bot) · origin (solo origen)
+const KIND_RANK = { origin: 0, external: 1, seen: 2, tracked: 3 };
+
+function buildGraph(rows, followedBy, redRows) {
   const nodeMap = new Map();
 
-  const ensureNode = (id, isGhost = false) => {
+  const ensureNode = (id, kind) => {
     if (!id) return null;
-    if (!nodeMap.has(id)) {
-      nodeMap.set(id, {
-        id,
-        username: id,
-        ghost: isGhost,
-        status: isGhost ? 'origin' : 'unknown',
-        mutual: false,
-        origen: '',
-        followed_at: '',
-        mutual_checked_at: '',
-        unfollowed_at: '',
-        last_updated: '',
-        profile_followers: '',
-        profile_following: '',
-        profile_ratio: '',
-        stand_type: '',
-      });
-    } else if (!isGhost) {
-      nodeMap.get(id).ghost = false;
+    let n = nodeMap.get(id);
+    if (!n) {
+      n = {
+        id, username: id, kind,
+        ghost: kind === 'origin',
+        status: kind === 'tracked' ? 'unknown' : kind,
+        mutual: false, origen: '',
+        followed_at: '', mutual_checked_at: '', unfollowed_at: '', last_updated: '',
+        profile_followers: '', profile_following: '', profile_ratio: '',
+        stand_type: '', request_state: '', is_private: null,
+        red: null,
+      };
+      nodeMap.set(id, n);
+    } else if (KIND_RANK[kind] > KIND_RANK[n.kind]) {
+      // aaa sube de categoria (ej: era origen fantasma y resulta q lo sigues) -bynd
+      n.kind = kind;
+      n.ghost = false;
+      if (kind !== 'tracked') n.status = kind;
     }
-    return nodeMap.get(id);
+    return n;
   };
 
-  const links = [];
+  // links por llave dirigida; una misma pareja puede ser follows Y origen
+  const linkMap = new Map();
+  const addLink = (s, t, type) => {
+    if (!s || !t || s === t) return;
+    const k = `${s}|${t}`;
+    let l = linkMap.get(k);
+    if (!l) { l = { source: s, target: t, types: new Set() }; linkMap.set(k, l); }
+    l.types.add(type);
+  };
+
+  // 1. stand_users → nodos tracked + aristas de origen
   rows.forEach(row => {
     const u = (row.username || '').trim();
     if (!u) return;
-    const node = ensureNode(u, false);
+    const node = ensureNode(u, 'tracked');
     Object.assign(node, {
+      kind: 'tracked',
+      ghost: false,
       followed_at: row.followed_at || '',
       status: (row.status || 'unknown').toLowerCase(),
       mutual: row.mutual === true || String(row.mutual || '').toLowerCase() === 'true',
@@ -84,93 +144,89 @@ function buildGraph(rows) {
       profile_following: row.profile_following ?? '',
       profile_ratio: row.profile_ratio ?? '',
       stand_type: row.stand_type || '',
+      request_state: row.request_state || '',
+      is_private: row.is_private ?? null,
     });
 
     const o = node.origen;
     if (o && o.toLowerCase() !== 'unknown' && o !== u) {
-      ensureNode(o, true);
-      links.push({ source: o, target: u });
+      ensureNode(o, 'origin');
+      addLink(o, u, 'origen');
     }
   });
 
-  const seen = new Set();
-  const dedup = [];
-  links.forEach(l => {
-    const k = `${l.source}|${l.target}`;
-    if (!seen.has(k)) { seen.add(k); dedup.push(l); }
+  // 2. followed_by → aristas follows (connection sigue a username)
+  (followedBy || []).forEach(r => {
+    const target = (r.username || '').trim();
+    const src = (r.connection || '').trim();
+    if (!target || !src) return;
+    ensureNode(target, 'seen');
+    ensureNode(src, 'external');   // toda connection es alguien que TÚ sigues
+    addLink(src, target, 'follows');
   });
 
-  return { nodes: Array.from(nodeMap.values()), links: dedup };
+  // 3. red_perfil → score por nodo (solo si el nodo existe)
+  (redRows || []).forEach(r => {
+    const n = nodeMap.get((r.username || '').trim());
+    if (n) n.red = r;
+  });
+
+  const links = Array.from(linkMap.values()).map(l => ({
+    source: l.source,
+    target: l.target,
+    types: l.types,
+    kind: l.types.has('follows') ? 'follows' : 'origen',
+  }));
+
+  return { nodes: Array.from(nodeMap.values()), links };
 }
 
 // ─── ADJACENCY ───────────────────────────────────────────
 function indexGraph(nodes, links) {
-  const adj = new Map();
-  const outAdj = new Map();
-  const inAdj = new Map();
-  const nodeMap = new Map();
-  nodes.forEach(n => {
-    adj.set(n.id, new Set());
-    outAdj.set(n.id, new Set());
-    inAdj.set(n.id, new Set());
-    nodeMap.set(n.id, n);
-  });
+  const mk = () => new Map(nodes.map(n => [n.id, new Set()]));
+  const adj = mk(), outAdj = mk(), inAdj = mk(), followOut = mk(), followIn = mk();
+  const nodeMap = new Map(nodes.map(n => [n.id, n]));
+
   links.forEach(l => {
-    const s = typeof l.source === 'object' ? l.source.id : l.source;
-    const t = typeof l.target === 'object' ? l.target.id : l.target;
+    const s = l.source.id || l.source;
+    const t = l.target.id || l.target;
     adj.get(s)?.add(t);
     adj.get(t)?.add(s);
-    outAdj.get(s)?.add(t);
-    inAdj.get(t)?.add(s);
+    if (l.types.has('origen')) { outAdj.get(s)?.add(t); inAdj.get(t)?.add(s); }
+    if (l.types.has('follows')) { followOut.get(s)?.add(t); followIn.get(t)?.add(s); }
   });
-  return { adj, outAdj, inAdj, nodeMap };
+  return { adj, outAdj, inAdj, followOut, followIn, nodeMap };
 }
 
-// ─── DEAD FAMILY DETECTION ───────────────────────────────
-// Para cada nodo con descendientes, hago BFS de TODA su descendencia
-// recursiva. Si ni un solo descendiente está vivo → familia muerta:
-// marco a todos los descendientes como dead, y al padre también si
-// no está vivo. Si el padre es mutual (yocee_crzz por ej.), se queda
-// con su color original aunque su familia haya muerto.
-//
-// Casos cubiertos:
-//   - Familia 100% muerta colgando de un mutual → solo descendientes en morado
-//   - Sub-rama muerta dentro de un árbol mixto → solo esa sub-rama en morado
-//   - Hoja inactive/request_canceled aislada con hermanos vivos → NO se pinta
+function linkBetween(a, b) {
+  return state.links.filter(l => {
+    const s = l.source.id || l.source, t = l.target.id || l.target;
+    return (s === a && t === b) || (s === b && t === a);
+  });
+}
+
+// ─── DEAD FAMILY DETECTION (solo aristas de origen) ──────
 function getAllDescendants(nodeId, outAdj) {
   const desc = new Set();
-  const queue = [];
-  const start = outAdj.get(nodeId);
-  if (start) start.forEach(c => queue.push(c));
+  const queue = [...(outAdj.get(nodeId) || [])];
   while (queue.length) {
     const x = queue.shift();
     if (desc.has(x)) continue;
     desc.add(x);
-    const children = outAdj.get(x);
-    if (children) children.forEach(c => { if (!desc.has(c)) queue.push(c); });
+    outAdj.get(x)?.forEach(c => { if (!desc.has(c)) queue.push(c); });
   }
   return desc;
 }
 
 function computeDeadFamilies() {
   const dead = new Set();
-
   state.nodes.forEach(n => {
     const descendants = getAllDescendants(n.id, state.outAdj);
-    if (descendants.size === 0) return; // hojas no son "familia"
-
-    let anyAlive = false;
-    for (const dId of descendants) {
-      const node = state.nodeMap.get(dId);
-      if (isAlive(node)) { anyAlive = true; break; }
-    }
-
-    if (!anyAlive) {
-      descendants.forEach(d => dead.add(d));
-      if (!isAlive(n)) dead.add(n.id);
-    }
+    if (descendants.size === 0) return;
+    for (const dId of descendants) if (isAlive(state.nodeMap.get(dId))) return;
+    descendants.forEach(d => dead.add(d));
+    if (!isAlive(n)) dead.add(n.id);
   });
-
   return dead;
 }
 
@@ -191,33 +247,172 @@ function connectedComponents(nodes, adj) {
   return count;
 }
 
+// ─── LOUVAIN (comunidades) ───────────────────────────────
+// Grafo no dirigido con pesos. adj: Map(n → Map(m → w)), simétrico;
+// un self-loop guarda 2·peso interno (así k = Σ adj y m2 = Σ k).
+function louvain(nodeIds, weightedEdges) {
+  let g = { nodes: nodeIds.slice(), adj: new Map(nodeIds.map(id => [id, new Map()])) };
+  weightedEdges.forEach(([a, b, w]) => {
+    if (a === b) return;
+    const ma = g.adj.get(a), mb = g.adj.get(b);
+    ma.set(b, (ma.get(b) || 0) + w);
+    mb.set(a, (mb.get(a) || 0) + w);
+  });
+
+  const partition = new Map(nodeIds.map(id => [id, id]));   // nodo original → super-nodo
+
+  for (let level = 0; level < 12; level++) {
+    const k = new Map();
+    let m2 = 0;
+    g.nodes.forEach(n => {
+      let s = 0;
+      g.adj.get(n).forEach(w => { s += w; });
+      k.set(n, s);
+      m2 += s;
+    });
+    if (m2 === 0) break;
+
+    const comm = new Map(g.nodes.map(n => [n, n]));
+    const tot = new Map(g.nodes.map(n => [n, k.get(n)]));
+    let improved = false;
+
+    for (let pass = 0; pass < 25; pass++) {
+      let moved = false;
+      for (const n of g.nodes) {
+        const cn = comm.get(n), kn = k.get(n);
+        const wTo = new Map();
+        g.adj.get(n).forEach((w, nb) => {
+          if (nb === n) return;
+          const c = comm.get(nb);
+          wTo.set(c, (wTo.get(c) || 0) + w);
+        });
+        tot.set(cn, tot.get(cn) - kn);
+        let best = cn;
+        let bestGain = (wTo.get(cn) || 0) - tot.get(cn) * kn / m2;
+        wTo.forEach((w, c) => {
+          const gain = w - tot.get(c) * kn / m2;
+          if (gain > bestGain + 1e-12) { bestGain = gain; best = c; }
+        });
+        tot.set(best, tot.get(best) + kn);
+        if (best !== cn) { comm.set(n, best); moved = true; improved = true; }
+      }
+      if (!moved) break;
+    }
+    if (!improved) break;
+
+    partition.forEach((sup, orig) => partition.set(orig, comm.get(sup)));
+
+    // aaa agregar: cada comunidad pasa a ser un super-nodo -bynd
+    const supers = Array.from(new Set(comm.values()));
+    const adj2 = new Map(supers.map(c => [c, new Map()]));
+    g.nodes.forEach(u => {
+      const cu = comm.get(u);
+      g.adj.get(u).forEach((w, v) => {
+        const cv = comm.get(v);
+        const m = adj2.get(cu);
+        m.set(cv, (m.get(cv) || 0) + w);
+      });
+    });
+    g = { nodes: supers, adj: adj2 };
+  }
+  return partition;
+}
+
+// ─── REDES: métricas + tier ──────────────────────────────
+function computeNetworks() {
+  const ids = state.nodes.map(n => n.id);
+  const edges = state.links.map(l => {
+    const w = (l.types.has('follows') ? EDGE_WEIGHT.follows : 0) +
+              (l.types.has('origen') ? EDGE_WEIGHT.origen : 0);
+    return [l.source.id || l.source, l.target.id || l.target, w];
+  });
+  const part = louvain(ids, edges);
+
+  const groups = new Map();
+  part.forEach((c, id) => {
+    if (!groups.has(c)) groups.set(c, []);
+    groups.get(c).push(id);
+  });
+
+  const nets = [];
+  groups.forEach(members => {
+    if (members.length < MIN_NET_SIZE) return;
+    // ey una familia muerta ya se ve en morado, no es "red" -bynd
+    if (members.every(id => state.deadSet.has(id))) return;
+    const set = new Set(members);
+    let mutuals = 0, yours = 0, seen = 0, followsYou = 0, scoreSum = 0, scoreN = 0;
+    members.forEach(id => {
+      const n = state.nodeMap.get(id);
+      if (n.mutual) mutuals++;
+      if (isYours(n)) yours++;
+      if (n.kind === 'seen') seen++;
+      if (n.red?.follows_you) followsYou++;
+      if (n.red && n.red.score != null) { scoreSum += Number(n.red.score); scoreN++; }
+    });
+    const size = members.length;
+    const index = (0.6 * mutuals + 0.4 * yours) / size;
+    const tier = (mutuals >= 2 && index >= 0.35) ? 'infiltrated'
+               : (mutuals >= 1 || index >= 0.20) ? 'contact'
+               : 'cold';
+
+    // ey hubs = los mas seguidos DENTRO de la red (follows), luego grado -bynd
+    const hubScore = id => {
+      let fin = 0;
+      state.followIn.get(id)?.forEach(x => { if (set.has(x)) fin++; });
+      let deg = 0;
+      state.adj.get(id)?.forEach(x => { if (set.has(x)) deg++; });
+      return fin * 10 + deg;
+    };
+    const hubs = members.slice().sort((a, b) => hubScore(b) - hubScore(a)).slice(0, 3);
+
+    // aaa nombre = el mas conectado dentro de la red (sigue o lo siguen) -bynd
+    const centrality = id => {
+      let deg = 0, fin = 0;
+      state.adj.get(id)?.forEach(x => { if (set.has(x)) deg++; });
+      state.followIn.get(id)?.forEach(x => { if (set.has(x)) fin++; });
+      return deg + fin;
+    };
+    const name = members.reduce((best, id) => centrality(id) > centrality(best) ? id : best, members[0]);
+
+    nets.push({
+      members, set, size, mutuals, yours, seen, followsYou, index, tier, hubs,
+      avgScore: scoreN ? scoreSum / scoreN : null,
+      name,
+    });
+  });
+
+  nets.sort((a, b) => b.index - a.index || b.size - a.size);
+  nets.forEach((n, i) => { n.id = i; });
+
+  const netOf = new Map();
+  nets.forEach(net => net.members.forEach(id => netOf.set(id, net)));
+  return { nets, netOf };
+}
+
 // ─── BFS SHORTEST PATH ───────────────────────────────────
 function shortestPath(adj, fromId, toId) {
   if (!adj.has(fromId) || !adj.has(toId)) return null;
   if (fromId === toId) return [fromId];
-  const prev = new Map();
+  const prev = new Map([[fromId, null]]);
   const queue = [fromId];
-  prev.set(fromId, null);
   while (queue.length) {
     const cur = queue.shift();
     if (cur === toId) {
       const path = [];
-      let x = cur;
-      while (x !== null) { path.unshift(x); x = prev.get(x); }
+      for (let x = cur; x !== null; x = prev.get(x)) path.unshift(x);
       return path;
     }
     adj.get(cur)?.forEach(nb => {
-      if (!prev.has(nb)) {
-        prev.set(nb, cur);
-        queue.push(nb);
-      }
+      if (!prev.has(nb)) { prev.set(nb, cur); queue.push(nb); }
     });
   }
   return null;
 }
 
 // ─── D3 RENDERING ────────────────────────────────────────
-let svg, gZoom, gLinks, gNodes, simulation, zoomBehavior;
+let svg, gZoom, gHulls, gLinks, gNodes, simulation, zoomBehavior;
+let allLinksSel, allNodesSel;
+const hullLine = d3.line().curve(d3.curveCatmullRomClosed.alpha(0.6));
 
 function initSvg() {
   svg = d3.select('#graph');
@@ -227,21 +422,23 @@ function initSvg() {
   const mk = (id, color) => defs.append('marker')
     .attr('id', id)
     .attr('viewBox', '0 -5 10 10')
-    .attr('refX', 14).attr('refY', 0)
+    .attr('refX', 16).attr('refY', 0)
     .attr('markerWidth', 6).attr('markerHeight', 6)
     .attr('orient', 'auto')
     .append('path').attr('d', 'M0,-5L10,0L0,5').attr('fill', color);
-  mk('arrow', '#444');
+  mk('arrow', '#555');
+  mk('arrow-origen', '#333');
   mk('arrow-hl', '#E8FF00');
   mk('arrow-path', '#FF00B3');
   mk('arrow-dead', DEAD_COLOR);
 
   gZoom = svg.append('g').attr('class', 'zoom-layer');
+  gHulls = gZoom.append('g').attr('class', 'hulls');
   gLinks = gZoom.append('g').attr('class', 'links');
   gNodes = gZoom.append('g').attr('class', 'nodes');
 
   zoomBehavior = d3.zoom()
-    .scaleExtent([0.1, 8])
+    .scaleExtent([0.08, 8])
     .on('zoom', (e) => gZoom.attr('transform', e.transform));
   svg.call(zoomBehavior);
 }
@@ -251,67 +448,72 @@ function destroySimulation() {
   if (svg) svg.selectAll('*').remove();
 }
 
+function tierColorOf(d) {
+  const net = state.netOf.get(d.id);
+  return net ? TIER[net.tier].color : '#2a2a2a';
+}
+
 function nodeColor(d) {
-  if (state.deadSet.has(d.id)) {
-    return d.ghost ? 'transparent' : DEAD_COLOR;
+  const dead = state.deadSet.has(d.id);
+  if (state.colorMode === 'network') {
+    if (d.ghost || d.kind === 'seen') return 'transparent';
+    return tierColorOf(d);
   }
+  if (dead) return d.ghost ? 'transparent' : DEAD_COLOR;
   if (d.ghost) return 'transparent';
   if (d.mutual) return '#E8FF00';
-  if (d.status === 'unfollowed') return '#444';
-  if (d.status === 'origin') return 'transparent';
+  if (d.kind === 'seen' || d.kind === 'external') return '#0a0a0a';
+  if (DEAD_STATUSES.has(d.status)) return '#444';
   return '#f5f5f5';
 }
 function nodeStroke(d) {
+  if (state.colorMode === 'network') {
+    return d.ghost ? '#666' : tierColorOf(d);
+  }
   if (state.deadSet.has(d.id)) return DEAD_COLOR;
   if (d.ghost) return '#666';
   if (d.mutual) return '#E8FF00';
-  if (d.status === 'unfollowed') return '#444';
+  if (d.kind === 'seen') return '#FF00B3';
+  if (d.kind === 'external') return '#f5f5f5';
+  if (DEAD_STATUSES.has(d.status)) return '#444';
   return '#f5f5f5';
 }
 function nodeRadius(d) {
   const deg = state.adj.get(d.id)?.size || 1;
-  return Math.min(12, 4 + Math.sqrt(deg) * 1.5);
+  const fin = state.followIn.get(d.id)?.size || 0;
+  // q chidoteee los q muchos de tu red siguen se ven mas grandes -bynd
+  return Math.min(16, 4 + Math.sqrt(deg) * 1.3 + Math.sqrt(fin) * 1.2);
 }
 
-// link 100% interno a familia muerta = ambos extremos en deadSet
 function linkIsDead(d) {
   const s = d.source.id || d.source;
   const t = d.target.id || d.target;
-  return state.deadSet.has(s) && state.deadSet.has(t);
+  return d.kind === 'origen' && state.deadSet.has(s) && state.deadSet.has(t);
+}
+
+function linkVisible(d) {
+  if (d.types.has('follows') && state.showFollows) return true;
+  if (d.types.has('origen') && state.showOrigen) return true;
+  return false;
 }
 
 function render() {
   const { width, height } = svg.node().getBoundingClientRect();
 
   const linkSel = gLinks.selectAll('line.link')
-    .data(state.links, d => `${(d.source.id||d.source)}|${(d.target.id||d.target)}`);
+    .data(state.links, d => `${(d.source.id || d.source)}|${(d.target.id || d.target)}`);
   linkSel.exit().remove();
-  const linkEnter = linkSel.enter().append('line')
-    .attr('class', 'link');
-  const allLinks = linkEnter.merge(linkSel);
-
-  allLinks
-    .style('stroke', d => linkIsDead(d) ? DEAD_COLOR : null)
-    .style('stroke-opacity', d => linkIsDead(d) ? 0.5 : null);
+  allLinksSel = linkSel.enter().append('line').merge(linkSel)
+    .attr('class', d => `link ${d.kind}`);
 
   const nodeSel = gNodes.selectAll('g.node').data(state.nodes, d => d.id);
   nodeSel.exit().remove();
   const nodeEnter = nodeSel.enter().append('g').attr('class', 'node');
   nodeEnter.append('circle');
-  nodeEnter.append('text').attr('dy', 18);
-  const allNodes = nodeEnter.merge(nodeSel);
+  nodeEnter.append('text');
+  allNodesSel = nodeEnter.merge(nodeSel);
 
-  allNodes.select('circle')
-    .attr('r', nodeRadius)
-    .attr('fill', nodeColor)
-    .attr('stroke', nodeStroke)
-    .attr('stroke-width', 1.5)
-    .attr('stroke-dasharray', d => d.ghost ? '2,2' : null);
-  allNodes.select('text')
-    .text(d => d.id)
-    .style('display', state.showLabels ? null : 'none');
-
-  allNodes
+  allNodesSel
     .on('click', (e, d) => { e.stopPropagation(); selectNode(d.id); })
     .on('mouseenter', (e, d) => showTooltip(e, d))
     .on('mousemove', moveTooltip)
@@ -321,109 +523,203 @@ function render() {
       .on('drag', (e, d) => { d.fx = e.x; d.fy = e.y; })
       .on('end', (e, d) => { if (!e.active) simulation.alphaTarget(0); if (!state.frozen) { d.fx = null; d.fy = null; } }));
 
+  styleGraph();
+
   if (simulation) simulation.stop();
   simulation = d3.forceSimulation(state.nodes)
-    .force('link', d3.forceLink(state.links).id(d => d.id).distance(60).strength(0.5))
-    .force('charge', d3.forceManyBody().strength(-180))
+    .force('link', d3.forceLink(state.links).id(d => d.id)
+      .distance(d => d.kind === 'follows' ? 55 : 75)
+      .strength(d => d.kind === 'follows' ? 0.6 : 0.35))
+    .force('charge', d3.forceManyBody().strength(-170).distanceMax(600))
     .force('center', d3.forceCenter(width / 2, height / 2))
+    .force('x', d3.forceX(width / 2).strength(0.02))
+    .force('y', d3.forceY(height / 2).strength(0.02))
     .force('collide', d3.forceCollide().radius(d => nodeRadius(d) + 6))
     .alpha(1)
     .alphaDecay(0.025);
 
+  let tick = 0;
   simulation.on('tick', () => {
-    allLinks
+    allLinksSel
       .attr('x1', d => d.source.x).attr('y1', d => d.source.y)
       .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
-    allNodes.attr('transform', d => `translate(${d.x},${d.y})`);
+    allNodesSel.attr('transform', d => `translate(${d.x},${d.y})`);
+    if (tick++ % 3 === 0) drawHulls();
   });
+  simulation.on('end', drawHulls);
 
-  svg.on('click', () => selectNode(null));
+  svg.on('click', () => { selectNode(null); });
+}
+
+// ey estilos q dependen de modo de color / toggles (sin reiniciar simulacion) -bynd
+function styleGraph() {
+  allNodesSel.select('circle')
+    .attr('r', nodeRadius)
+    .attr('fill', nodeColor)
+    .attr('stroke', nodeStroke)
+    .attr('stroke-width', 1.5)
+    .attr('stroke-dasharray', d => d.ghost ? '2,2' : null);
+  allNodesSel.select('text')
+    .attr('dy', d => nodeRadius(d) + 10)
+    .text(d => d.id)
+    .style('display', state.showLabels ? null : 'none');
+  allLinksSel
+    .style('display', d => linkVisible(d) ? null : 'none')
+    .style('stroke', d => linkIsDead(d) ? DEAD_COLOR : null)
+    .style('stroke-opacity', d => linkIsDead(d) ? 0.5 : null);
+}
+
+// ─── HULLS DE REDES ──────────────────────────────────────
+function hullPoints(net) {
+  const pts = [];
+  net.members.forEach(id => {
+    const n = state.nodeMap.get(id);
+    if (n.x == null) return;
+    const r = nodeRadius(n) + 14;
+    pts.push([n.x - r, n.y], [n.x + r, n.y], [n.x, n.y - r], [n.x, n.y + r]);
+  });
+  return pts.length >= 6 ? d3.polygonHull(pts) : null;
+}
+
+function drawHulls() {
+  if (!gHulls) return;
+  const nets = state.showHulls ? state.nets : [];
+
+  const sel = gHulls.selectAll('g.hull').data(nets, d => d.id);
+  sel.exit().remove();
+  const enter = sel.enter().append('g').attr('class', 'hull');
+  enter.append('path');
+  enter.append('text');
+  const all = enter.merge(sel);
+
+  all.attr('class', d => `hull tier-${d.tier}` +
+    (state.focusNet != null && state.focusNet !== d.id ? ' dim' : '') +
+    (state.focusNet === d.id ? ' focus' : ''));
+
+  all.each(function (net) {
+    const g = d3.select(this);
+    const hull = hullPoints(net);
+    if (!hull) { g.style('display', 'none'); return; }
+    g.style('display', null);
+    const c = TIER[net.tier].color;
+    g.select('path')
+      .attr('d', hullLine(hull))
+      .attr('fill', c)
+      .attr('fill-opacity', 0.03 + net.index * 0.12)
+      .attr('stroke', c)
+      .attr('stroke-opacity', net.tier === 'cold' ? 0.35 : 0.6)
+      .attr('stroke-dasharray', net.tier === 'cold' ? '4,4' : null)
+      .on('click', (e) => { e.stopPropagation(); toggleFocusNet(net.id); });
+
+    // aaa etiqueta arriba del casco -bynd
+    let top = hull[0];
+    hull.forEach(p => { if (p[1] < top[1]) top = p; });
+    const cx = d3.mean(hull, p => p[0]);
+    g.select('text')
+      .attr('x', cx).attr('y', top[1] - 6)
+      .attr('fill', c)
+      .text(`${TIER[net.tier].label} · @${net.name} · ${Math.round(net.index * 100)}%`);
+  });
+}
+
+// ─── HIGHLIGHTS ──────────────────────────────────────────
+function matchesFilter(d) {
+  switch (state.filter) {
+    case 'mutual': return d.mutual;
+    case 'active': return d.status === 'active';
+    case 'unfollowed': return DEAD_STATUSES.has(d.status);
+    case 'origin': return d.ghost || (state.outAdj.get(d.id)?.size > 0);
+    case 'seen': return d.kind === 'seen';
+    case 'infiltrated': return state.netOf.get(d.id)?.tier === 'infiltrated';
+    case 'dead': return state.deadSet.has(d.id);
+    default: return true;
+  }
 }
 
 function applyHighlights() {
+  if (!allNodesSel) return;
   const sel = state.selectedId;
   const path = state.pathIds;
-  const filter = state.filter;
   const search = (document.getElementById('searchInput').value || '').toLowerCase().trim();
+  const focus = state.focusNet != null ? state.nets[state.focusNet] : null;
+  const neighbors = sel ? (state.adj.get(sel) || new Set()) : null;
 
-  gNodes.selectAll('g.node').each(function(d) {
+  const dimMap = new Map();
+  allNodesSel.each(function (d) {
     const el = d3.select(this);
-    let dim = false;
+    let dim = !matchesFilter(d);
     let highlight = false;
-
-    if (filter !== 'all') {
-      if (filter === 'mutual' && !d.mutual) dim = true;
-      else if (filter === 'active' && d.status !== 'active') dim = true;
-      else if (filter === 'unfollowed' && d.status !== 'unfollowed') dim = true;
-      else if (filter === 'origin' && !d.ghost && state.outAdj.get(d.id)?.size === 0) dim = true;
-      else if (filter === 'dead' && !state.deadSet.has(d.id)) dim = true;
-    }
     if (search && !d.id.toLowerCase().includes(search)) dim = true;
+    if (focus && !focus.set.has(d.id)) dim = true;
 
     if (sel) {
-      const neighbors = state.adj.get(sel) || new Set();
       if (d.id === sel || neighbors.has(d.id)) { dim = false; highlight = (d.id !== sel); }
       else dim = true;
     }
     const inPath = path.has(d.id);
     if (inPath) dim = false;
 
+    dimMap.set(d.id, dim);
     el.classed('dim', dim);
     el.classed('highlight', highlight && !inPath);
     el.classed('selected', d.id === sel && !inPath);
     el.classed('path', inPath);
   });
 
-  gLinks.selectAll('line.link').each(function(d) {
+  const ordered = state.pathOrdered || [];
+  const pathPairs = new Set();
+  for (let i = 0; i < ordered.length - 1; i++) {
+    pathPairs.add(`${ordered[i]}|${ordered[i + 1]}`);
+    pathPairs.add(`${ordered[i + 1]}|${ordered[i]}`);
+  }
+
+  allLinksSel.each(function (d) {
     const el = d3.select(this);
     const sId = d.source.id || d.source;
     const tId = d.target.id || d.target;
-    let dim = false;
+    const inPath = pathPairs.has(`${sId}|${tId}`);
+    let dim = dimMap.get(sId) || dimMap.get(tId);
     let highlight = false;
-    let inPath = false;
-
-    if (path.size > 1) {
-      const ordered = state.pathOrdered || [];
-      for (let i = 0; i < ordered.length - 1; i++) {
-        const a = ordered[i], b = ordered[i+1];
-        if ((sId === a && tId === b) || (sId === b && tId === a)) { inPath = true; break; }
-      }
-    }
-
     if (sel) {
-      if (sId === sel || tId === sel) highlight = true;
+      if (sId === sel || tId === sel) { highlight = true; dim = false; }
       else dim = true;
-    }
-    if (filter !== 'all' || search) {
-      const sDim = d3.select(gNodes.selectAll('g.node').filter(n => n.id === sId).node()).classed('dim');
-      const tDim = d3.select(gNodes.selectAll('g.node').filter(n => n.id === tId).node()).classed('dim');
-      if (sDim || tDim) dim = true;
     }
     if (inPath) { dim = false; highlight = false; }
 
     el.classed('dim', dim);
-    el.classed('highlight', highlight && !inPath);
+    el.classed('highlight', highlight);
     el.classed('path', inPath);
 
-    const isDead = state.deadSet.has(sId) && state.deadSet.has(tId);
-    let marker = 'url(#arrow)';
+    let marker = d.kind === 'origen' ? 'url(#arrow-origen)' : 'url(#arrow)';
     if (inPath) marker = 'url(#arrow-path)';
     else if (highlight) marker = 'url(#arrow-hl)';
-    else if (isDead) marker = 'url(#arrow-dead)';
+    else if (linkIsDead(d)) marker = 'url(#arrow-dead)';
     el.attr('marker-end', marker);
   });
+
+  drawHulls();
 }
 
 // ─── TOOLTIP ─────────────────────────────────────────────
 const tooltipEl = document.getElementById('tooltip');
+const KIND_LABEL = {
+  tracked: null,
+  seen: 'perfil visto · no lo sigues',
+  external: 'lo sigues (fuera del bot)',
+  origin: '[ origin only ]',
+};
 function showTooltip(e, d) {
-  const inDeg = state.inAdj.get(d.id)?.size || 0;
-  const outDeg = state.outAdj.get(d.id)?.size || 0;
+  const fin = state.followIn.get(d.id)?.size || 0;
+  const fout = state.followOut.get(d.id)?.size || 0;
   const deadTag = state.deadSet.has(d.id) ? ' · dead family' : '';
+  const net = state.netOf.get(d.id);
+  const kind = KIND_LABEL[d.kind] || (d.status || '—');
   tooltipEl.innerHTML = `
     <div class="tooltip-name">@${d.id}</div>
-    <div>${d.ghost ? '[ origin only ]' : (d.status || '—')}${d.mutual ? ' · mutual' : ''}${deadTag}</div>
-    <div style="color:var(--muted);margin-top:2px;">in ${inDeg} · out ${outDeg}</div>
+    <div>${kind}${d.mutual ? ' · mutual' : ''}${deadTag}</div>
+    <div style="color:var(--muted);margin-top:2px;">lo siguen ${fin} · sigue ${fout}</div>
+    ${net ? `<div style="color:${TIER[net.tier].color};margin-top:2px;">red @${net.name} · ${TIER[net.tier].label}</div>` : ''}
+    ${d.red ? `<div style="color:var(--muted);">score ${d.red.score}</div>` : ''}
   `;
   tooltipEl.classList.add('show');
   moveTooltip(e);
@@ -441,6 +737,14 @@ function selectNode(id) {
   applyHighlights();
 }
 
+function chipList(title, ids, cls) {
+  if (!ids.length) return '';
+  let html = `<div class="neighbors-title">${title}</div>`;
+  ids.slice(0, 30).forEach(n => html += `<span class="neighbor-chip ${cls}" data-jump="${n}">@${n}</span>`);
+  if (ids.length > 30) html += `<span class="neighbor-chip">+${ids.length - 30}</span>`;
+  return html;
+}
+
 function renderNodeInfo() {
   const box = document.getElementById('nodeInfo');
   if (!state.selectedId) {
@@ -452,51 +756,59 @@ function renderNodeInfo() {
 
   const ins = Array.from(state.inAdj.get(d.id) || []);
   const outs = Array.from(state.outAdj.get(d.id) || []);
-  const isDead = state.deadSet.has(d.id);
+  const fins = Array.from(state.followIn.get(d.id) || []);
+  const fouts = Array.from(state.followOut.get(d.id) || []);
+  const net = state.netOf.get(d.id);
 
-  let html = `<div class="node-info-name">${d.id}</div>`;
-  html += '<dl>';
-  if (isDead) {
-    html += `<dt>family</dt><dd style="color:${DEAD_COLOR};">dead branch</dd>`;
+  let html = `<div class="node-info-name">${d.id}</div><dl>`;
+  if (state.deadSet.has(d.id)) html += `<dt>family</dt><dd style="color:${DEAD_COLOR};">dead branch</dd>`;
+  if (net) {
+    html += `<dt>red</dt><dd><span class="tier-badge tier-${net.tier}" data-net="${net.id}">${TIER[net.tier].label}</span> @${net.name}</dd>`;
+    if (net.hubs.includes(d.id)) html += `<dt>rol</dt><dd class="accent">hub de su red</dd>`;
   }
-  if (d.ghost) {
-    html += `<dt>type</dt><dd class="accent">origin only</dd>`;
-    html += `<dt>incoming</dt><dd>${ins.length}</dd>`;
-    html += `<dt>spawned</dt><dd class="accent">${outs.length}</dd>`;
-  } else {
-    html += `<dt>status</dt><dd class="${d.status==='active'?'accent':''}">${d.status||'—'}</dd>`;
-    html += `<dt>mutual</dt><dd class="${d.mutual?'accent':''}">${d.mutual?'yes':'no'}</dd>`;
-    html += `<dt>origen</dt><dd class="pink">${d.origen||'—'}</dd>`;
-    if (d.followed_at) html += `<dt>followed</dt><dd>${(d.followed_at||'').slice(0,10)}</dd>`;
-    if (d.unfollowed_at) html += `<dt>unfollowed</dt><dd class="pink">${(d.unfollowed_at||'').slice(0,10)}</dd>`;
-    if (d.last_updated) html += `<dt>updated</dt><dd>${(d.last_updated||'').slice(0,10)}</dd>`;
-    if (d.profile_followers) html += `<dt>followers</dt><dd>${d.profile_followers}</dd>`;
-    if (d.profile_following) html += `<dt>following</dt><dd>${d.profile_following}</dd>`;
-    if (d.profile_ratio) html += `<dt>ratio</dt><dd>${d.profile_ratio}</dd>`;
+
+  if (d.kind === 'tracked') {
+    html += `<dt>status</dt><dd class="${d.status === 'active' ? 'accent' : ''}">${d.status || '—'}</dd>`;
+    html += `<dt>mutual</dt><dd class="${d.mutual ? 'accent' : ''}">${d.mutual ? 'yes' : 'no'}</dd>`;
+    html += `<dt>origen</dt><dd class="pink">${d.origen || '—'}</dd>`;
+    if (d.request_state) html += `<dt>request</dt><dd>${d.request_state}</dd>`;
+    if (d.is_private != null) html += `<dt>cuenta</dt><dd>${d.is_private ? 'privada' : 'pública'}</dd>`;
+    if (d.followed_at) html += `<dt>followed</dt><dd>${d.followed_at.slice(0, 10)}</dd>`;
+    if (d.unfollowed_at) html += `<dt>unfollowed</dt><dd class="pink">${d.unfollowed_at.slice(0, 10)}</dd>`;
+    if (d.last_updated) html += `<dt>updated</dt><dd>${d.last_updated.slice(0, 10)}</dd>`;
+    if (d.profile_followers !== '') html += `<dt>followers</dt><dd>${d.profile_followers}</dd>`;
+    if (d.profile_following !== '') html += `<dt>following</dt><dd>${d.profile_following}</dd>`;
+    if (d.profile_ratio !== '') html += `<dt>ratio</dt><dd>${d.profile_ratio}</dd>`;
     if (d.stand_type) html += `<dt>type</dt><dd>${d.stand_type}</dd>`;
-    html += `<dt>incoming</dt><dd>${ins.length}</dd>`;
-    html += `<dt>outgoing</dt><dd class="accent">${outs.length}</dd>`;
+  } else {
+    html += `<dt>type</dt><dd class="accent">${KIND_LABEL[d.kind]}</dd>`;
   }
+
+  if (d.red) {
+    html += `<dt>score red</dt><dd class="accent">${d.red.score}</dd>`;
+    html += `<dt>conexiones</dt><dd>${d.red.total_conns} (${d.red.mutual_conns} mutual)</dd>`;
+    if (d.red.follows_you) html += `<dt>te sigue</dt><dd class="accent">yes</dd>`;
+    if (d.red.checked_at) html += `<dt>evaluado</dt><dd>${String(d.red.checked_at).slice(0, 10)}</dd>`;
+  }
+  html += `<dt>lo siguen</dt><dd>${fins.length}</dd>`;
+  html += `<dt>sigue a</dt><dd>${fouts.length}</dd>`;
   html += '</dl>';
 
-  if (ins.length || outs.length) {
+  if (ins.length || outs.length || fins.length || fouts.length) {
     html += '<div class="neighbors">';
-    if (ins.length) {
-      html += '<div class="neighbors-title">← incoming (origenes)</div>';
-      ins.slice(0, 30).forEach(n => html += `<span class="neighbor-chip in" data-jump="${n}">@${n}</span>`);
-      if (ins.length > 30) html += `<span class="neighbor-chip">+${ins.length-30}</span>`;
-    }
-    if (outs.length) {
-      html += '<div class="neighbors-title" style="margin-top:8px;">→ outgoing (spawned)</div>';
-      outs.slice(0, 30).forEach(n => html += `<span class="neighbor-chip out" data-jump="${n}">@${n}</span>`);
-      if (outs.length > 30) html += `<span class="neighbor-chip">+${outs.length-30}</span>`;
-    }
+    html += chipList('← lo siguen (gente que sigues)', fins, 'in');
+    html += chipList('→ sigue a', fouts, 'out');
+    html += chipList('← origen (cacheado desde)', ins, 'in');
+    html += chipList('→ spawned (cacheados desde aquí)', outs, 'out');
     html += '</div>';
   }
 
   box.innerHTML = html;
   box.querySelectorAll('[data-jump]').forEach(el => {
-    el.addEventListener('click', () => selectNode(el.getAttribute('data-jump')));
+    el.addEventListener('click', () => { const id = el.getAttribute('data-jump'); selectNode(id); focusNode(id); });
+  });
+  box.querySelectorAll('[data-net]').forEach(el => {
+    el.addEventListener('click', () => toggleFocusNet(Number(el.getAttribute('data-net'))));
   });
 }
 
@@ -506,21 +818,15 @@ function runSearch() {
   const box = document.getElementById('searchResults');
   if (!q) { box.innerHTML = ''; applyHighlights(); return; }
 
-  const filter = state.filter;
-  const matches = state.nodes.filter(n => {
-    if (!n.id.toLowerCase().includes(q)) return false;
-    if (filter === 'mutual') return n.mutual;
-    if (filter === 'active') return n.status === 'active';
-    if (filter === 'unfollowed') return n.status === 'unfollowed';
-    if (filter === 'origin') return n.ghost || (state.outAdj.get(n.id)?.size > 0);
-    if (filter === 'dead') return state.deadSet.has(n.id);
-    return true;
-  }).slice(0, 50);
+  const matches = state.nodes
+    .filter(n => n.id.toLowerCase().includes(q) && matchesFilter(n))
+    .slice(0, 50);
 
   box.innerHTML = matches.map(n => {
     const tag = state.deadSet.has(n.id) ? 'dead'
       : n.ghost ? 'origin'
-      : (n.mutual ? 'mutual' : (n.status||'—'));
+      : n.mutual ? 'mutual'
+      : n.kind === 'tracked' ? (n.status || '—') : n.kind;
     return `<div class="search-result" data-id="${n.id}">
       <span>@${n.id}</span><span class="badge">${tag}</span>
     </div>`;
@@ -540,14 +846,91 @@ function focusNode(id) {
   if (!n || n.x == null) return;
   const { width, height } = svg.node().getBoundingClientRect();
   const k = 1.6;
-  const t = d3.zoomIdentity.translate(width/2 - n.x*k, height/2 - n.y*k).scale(k);
+  const t = d3.zoomIdentity.translate(width / 2 - n.x * k, height / 2 - n.y * k).scale(k);
   svg.transition().duration(500).call(zoomBehavior.transform, t);
 }
 
+function zoomToMembers(ids) {
+  const pts = ids.map(id => state.nodeMap.get(id)).filter(n => n && n.x != null);
+  if (!pts.length) return;
+  const { width, height } = svg.node().getBoundingClientRect();
+  const [x0, x1] = d3.extent(pts, p => p.x);
+  const [y0, y1] = d3.extent(pts, p => p.y);
+  const pad = 80;
+  const k = Math.min(3, 0.9 / Math.max((x1 - x0 + pad) / width, (y1 - y0 + pad) / height));
+  const t = d3.zoomIdentity.translate(width / 2 - k * (x0 + x1) / 2, height / 2 - k * (y0 + y1) / 2).scale(k);
+  svg.transition().duration(600).call(zoomBehavior.transform, t);
+}
+
+// ─── REDES: panel + foco ─────────────────────────────────
+function toggleFocusNet(id) {
+  state.focusNet = state.focusNet === id ? null : id;
+  if (state.focusNet != null) zoomToMembers(state.nets[id].members);
+  renderNetworks();
+  applyHighlights();
+}
+
+function renderNetworks() {
+  const list = document.getElementById('netList');
+  const summary = document.getElementById('netSummary');
+  if (!list) return;
+
+  const count = t => state.nets.filter(n => n.tier === t).length;
+  summary.innerHTML = state.nets.length
+    ? `<span class="tier-text tier-infiltrated">${count('infiltrated')} infiltrated</span> ·
+       <span class="tier-text tier-contact">${count('contact')} contact</span> ·
+       <span class="tier-text tier-cold">${count('cold')} cold</span>`
+    : '';
+
+  if (!state.nets.length) {
+    list.innerHTML = `<div class="path-empty">${state.hasFollowData
+      ? 'no hay redes de ≥ 3 nodos todavía'
+      : 'sin datos de followed_by · solo hay linaje de origen'}</div>`;
+    return;
+  }
+
+  list.innerHTML = state.nets.map(net => {
+    const pct = Math.round(net.index * 100);
+    const hubs = net.hubs.map(h => `<span class="neighbor-chip" data-jump="${h}">@${h}</span>`).join('');
+    return `<div class="net-item tier-${net.tier}${state.focusNet === net.id ? ' focus' : ''}" data-net="${net.id}">
+      <div class="net-head">
+        <span class="net-name">@${net.name}</span>
+        <span class="tier-badge tier-${net.tier}">${TIER[net.tier].label}</span>
+      </div>
+      <div class="net-meta">${net.size} nodos · ${net.mutuals} mutual · ${net.yours} sigues · ${net.seen} vistos${net.followsYou ? ` · ${net.followsYou} te siguen` : ''}${net.avgScore != null ? ` · score ⌀${net.avgScore.toFixed(1)}` : ''}</div>
+      <div class="net-bar"><div class="net-bar-fill" style="width:${pct}%"></div><span>${pct}%</span></div>
+      <div class="net-hubs">${hubs}</div>
+    </div>`;
+  }).join('');
+
+  list.querySelectorAll('.net-item').forEach(el => {
+    el.addEventListener('click', () => toggleFocusNet(Number(el.getAttribute('data-net'))));
+  });
+  list.querySelectorAll('[data-jump]').forEach(el => {
+    el.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const id = el.getAttribute('data-jump');
+      selectNode(id);
+      focusNode(id);
+    });
+  });
+}
+
 // ─── PATH FINDING ────────────────────────────────────────
+function relationLabel(a, b) {
+  const parts = [];
+  linkBetween(a, b).forEach(l => {
+    const s = l.source.id || l.source;
+    const fwd = s === a;
+    if (l.types.has('follows')) parts.push(fwd ? '↓ sigue a' : '↑ lo sigue');
+    if (l.types.has('origen')) parts.push(fwd ? '↓ spawned' : '↑ origen of');
+  });
+  return parts.join(' · ') || '·';
+}
+
 function tracePath() {
-  const fromId = document.getElementById('pathFrom').value.trim();
-  const toId   = document.getElementById('pathTo').value.trim();
+  const fromId = document.getElementById('pathFrom').value.trim().replace(/^@/, '');
+  const toId = document.getElementById('pathTo').value.trim().replace(/^@/, '');
   const out = document.getElementById('pathResult');
 
   if (!fromId || !toId) {
@@ -555,7 +938,7 @@ function tracePath() {
     return;
   }
   if (!state.nodeMap.has(fromId)) { out.innerHTML = `<div class="path-fail">@${fromId} not in graph</div>`; return; }
-  if (!state.nodeMap.has(toId))   { out.innerHTML = `<div class="path-fail">@${toId} not in graph</div>`; return; }
+  if (!state.nodeMap.has(toId)) { out.innerHTML = `<div class="path-fail">@${toId} not in graph</div>`; return; }
 
   const path = shortestPath(state.adj, fromId, toId);
   if (!path) {
@@ -570,16 +953,12 @@ function tracePath() {
   state.pathOrdered = path;
 
   const hops = path.length - 1;
-  let html = `<div class="path-success">${hops} hop${hops!==1?'s':''} · ${path.length} nodes</div>`;
+  let html = `<div class="path-success">${hops} hop${hops !== 1 ? 's' : ''} · ${path.length} nodes</div>`;
   path.forEach((id, i) => {
     html += `<div class="path-step" data-id="${id}">
-      <span class="num">${String(i+1).padStart(2,'0')}</span><span>@${id}</span>
+      <span class="num">${String(i + 1).padStart(2, '0')}</span><span>@${id}</span>
     </div>`;
-    if (i < path.length - 1) {
-      const a = path[i], b = path[i+1];
-      const forward = state.outAdj.get(a)?.has(b);
-      html += `<div class="path-arrow">${forward ? '↓ spawned' : '↑ origen of'}</div>`;
-    }
+    if (i < path.length - 1) html += `<div class="path-arrow">${relationLabel(path[i], path[i + 1])}</div>`;
   });
   out.innerHTML = html;
   out.querySelectorAll('.path-step').forEach(el => {
@@ -603,57 +982,56 @@ function clearPath() {
 
 // ─── STATS RENDERING ─────────────────────────────────────
 function renderStats() {
-  document.getElementById('statNodes').textContent = state.nodes.length;
-  document.getElementById('statEdges').textContent = state.links.length;
-  const mutuals = state.nodes.filter(n => n.mutual).length;
-  document.getElementById('statMutuals').textContent = mutuals;
+  const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+  const nFollows = state.links.filter(l => l.types.has('follows')).length;
+  const nOrigen = state.links.filter(l => l.types.has('origen')).length;
+  set('statNodes', state.nodes.length);
+  set('statEdges', state.links.length);
+  set('statEdgesSub', `${nFollows} follows · ${nOrigen} origen`);
+  set('statMutuals', state.nodes.filter(n => n.mutual).length);
   let originCount = 0;
-  state.outAdj.forEach((s) => { if (s.size > 0) originCount++; });
-  document.getElementById('statOrigins').textContent = originCount;
-  document.getElementById('statComponents').textContent = connectedComponents(state.nodes, state.adj);
-  const avgDeg = state.nodes.length ? (2 * state.links.length / state.nodes.length).toFixed(2) : 0;
-  document.getElementById('statDegree').textContent = avgDeg;
-
-  const statDead = document.getElementById('statDead');
-  if (statDead) statDead.textContent = state.deadSet.size;
+  state.outAdj.forEach(s => { if (s.size > 0) originCount++; });
+  set('statOrigins', originCount);
+  set('statComponents', connectedComponents(state.nodes, state.adj));
+  set('statDegree', state.nodes.length ? (2 * state.links.length / state.nodes.length).toFixed(2) : 0);
+  set('statNets', state.nets.length);
+  set('statInfiltrated', state.nets.filter(n => n.tier === 'infiltrated').length);
+  set('statDead', state.deadSet.size);
 }
 
 // ─── DASHBOARD UI WIRING ─────────────────────────────────
 function wireDashboardUI() {
   const searchInput = document.getElementById('searchInput');
-  searchInput.removeEventListener?.('input', runSearch);
-  searchInput.addEventListener('input', runSearch);
+  searchInput.oninput = runSearch;
 
   document.querySelectorAll('.chip').forEach(c => {
-    const clone = c.cloneNode(true);
-    c.replaceWith(clone);
-  });
-  document.querySelectorAll('.chip').forEach(c => {
-    c.addEventListener('click', () => {
+    c.onclick = () => {
       document.querySelectorAll('.chip').forEach(x => x.classList.remove('active'));
       c.classList.add('active');
       state.filter = c.getAttribute('data-filter');
       runSearch();
       applyHighlights();
-    });
+    };
+    c.classList.toggle('active', c.getAttribute('data-filter') === state.filter);
   });
 
-  const pathBtn = document.getElementById('pathBtn');
-  const pathClear = document.getElementById('pathClearBtn');
   const pathFrom = document.getElementById('pathFrom');
   const pathTo = document.getElementById('pathTo');
-  pathBtn.onclick = tracePath;
-  pathClear.onclick = clearPath;
+  document.getElementById('pathBtn').onclick = tracePath;
+  document.getElementById('pathClearBtn').onclick = clearPath;
   pathFrom.onkeydown = (e) => { if (e.key === 'Enter') tracePath(); };
-  pathTo.onkeydown   = (e) => { if (e.key === 'Enter') tracePath(); };
+  pathTo.onkeydown = (e) => { if (e.key === 'Enter') tracePath(); };
 
   document.getElementById('resetBtn').onclick = () => {
+    state.focusNet = null;
+    renderNetworks();
+    applyHighlights();
     svg.transition().duration(400).call(zoomBehavior.transform, d3.zoomIdentity);
     if (simulation) simulation.alpha(0.6).restart();
   };
   document.getElementById('freezeBtn').onclick = (e) => {
     state.frozen = !state.frozen;
-    e.target.classList.toggle('active', state.frozen);
+    e.currentTarget.classList.toggle('active', state.frozen);
     if (state.frozen) {
       state.nodes.forEach(n => { n.fx = n.x; n.fy = n.y; });
       simulation?.stop();
@@ -662,23 +1040,50 @@ function wireDashboardUI() {
       simulation?.alpha(0.3).restart();
     }
   };
-  document.getElementById('labelsBtn').onclick = (e) => {
-    state.showLabels = !state.showLabels;
-    e.target.classList.toggle('active', state.showLabels);
-    gNodes.selectAll('g.node text').style('display', state.showLabels ? null : 'none');
+
+  const toggle = (btnId, key, after) => {
+    const b = document.getElementById(btnId);
+    if (!b) return;
+    b.classList.toggle('active', !!state[key]);
+    b.onclick = () => {
+      state[key] = !state[key];
+      b.classList.toggle('active', state[key]);
+      after();
+    };
   };
+  toggle('labelsBtn', 'showLabels', styleGraph);
+  toggle('followsBtn', 'showFollows', styleGraph);
+  toggle('origenBtn', 'showOrigen', styleGraph);
+  toggle('hullsBtn', 'showHulls', drawHulls);
+
+  const colorBtn = document.getElementById('colorBtn');
+  if (colorBtn) {
+    const paint = () => {
+      colorBtn.textContent = state.colorMode === 'network' ? 'COLOR: RED' : 'COLOR: STATUS';
+      colorBtn.classList.toggle('active', state.colorMode === 'network');
+      document.getElementById('legendStatus')?.classList.toggle('hidden', state.colorMode === 'network');
+      document.getElementById('legendNetwork')?.classList.toggle('hidden', state.colorMode !== 'network');
+    };
+    paint();
+    colorBtn.onclick = () => {
+      state.colorMode = state.colorMode === 'network' ? 'status' : 'network';
+      paint();
+      styleGraph();
+    };
+  }
 
   window.onresize = () => {
     if (!simulation) return;
     const { width, height } = svg.node().getBoundingClientRect();
-    simulation.force('center', d3.forceCenter(width/2, height/2));
+    simulation.force('center', d3.forceCenter(width / 2, height / 2));
     simulation.alpha(0.3).restart();
   };
 }
 
 // ─── ENTRY POINT ─────────────────────────────────────────
-function buildDashboard(rows) {
-  const { nodes, links } = buildGraph(rows);
+// extras = { followedBy: [{username, connection}], red: [{username, score, ...}] }
+function buildDashboard(rows, extras = {}) {
+  const { nodes, links } = buildGraph(rows, extras.followedBy, extras.red);
   if (!nodes.length) {
     showToast('no nodes in result');
     return;
@@ -686,12 +1091,14 @@ function buildDashboard(rows) {
 
   state.nodes = nodes;
   state.links = links;
+  state.hasFollowData = (extras.followedBy || []).length > 0;
   const idx = indexGraph(nodes, links);
-  state.adj = idx.adj;
-  state.outAdj = idx.outAdj;
-  state.inAdj = idx.inAdj;
-  state.nodeMap = idx.nodeMap;
+  Object.assign(state, idx);
   state.deadSet = computeDeadFamilies();
+  const { nets, netOf } = computeNetworks();
+  state.nets = nets;
+  state.netOf = netOf;
+  state.focusNet = null;
   state.selectedId = null;
   state.pathIds = new Set();
   state.pathOrdered = [];
@@ -700,6 +1107,7 @@ function buildDashboard(rows) {
   initSvg();
   render();
   renderStats();
+  renderNetworks();
   renderNodeInfo();
   wireDashboardUI();
   runSearch();
@@ -708,16 +1116,14 @@ function buildDashboard(rows) {
 
 function destroyDashboard() {
   destroySimulation();
-  state.nodes = [];
-  state.links = [];
-  state.adj = new Map();
-  state.outAdj = new Map();
-  state.inAdj = new Map();
-  state.nodeMap = new Map();
-  state.deadSet = new Set();
-  state.selectedId = null;
-  state.pathIds = new Set();
-  state.pathOrdered = [];
+  Object.assign(state, {
+    nodes: [], links: [],
+    adj: new Map(), outAdj: new Map(), inAdj: new Map(),
+    followOut: new Map(), followIn: new Map(), nodeMap: new Map(),
+    deadSet: new Set(), nets: [], netOf: new Map(), focusNet: null,
+    selectedId: null, pathIds: new Set(), pathOrdered: [],
+  });
+  allNodesSel = allLinksSel = null;
 }
 
 // ─── TOAST helper ────────────────────────────────────────
@@ -725,7 +1131,7 @@ function showToast(msg) {
   const el = document.getElementById('toast');
   el.textContent = msg;
   el.classList.add('show');
-  setTimeout(() => el.classList.remove('show'), 3500);
+  setTimeout(() => el.classList.remove('show'), 4500);
 }
 
-window.POLPO_DASHBOARD = { buildDashboard, destroyDashboard, showToast };
+window.POLPO_DASHBOARD = { buildDashboard, destroyDashboard, showToast, _louvain: louvain };
