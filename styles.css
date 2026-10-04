@@ -212,7 +212,7 @@ header .meta button:hover {
 /* ═══════════ STATS BAR ═══════════ */
 .stats {
   display: grid;
-  grid-template-columns: repeat(6, 1fr);
+  grid-template-columns: repeat(8, 1fr);
   border-bottom: 1px solid var(--dim);
   background: var(--bg-alt);
 }
@@ -626,3 +626,111 @@ aside.sidebar::-webkit-scrollbar-thumb { background: var(--dim); }
   .stat:nth-child(3) { border-right: none; }
   .stat:nth-child(n+4) { border-top: 1px solid var(--dim); }
 }
+
+/* ═══════════ v3 · REDES INFILTRADAS ═══════════ */
+.hidden { display: none !important; }
+
+.stat-sub {
+  font-size: 9px;
+  color: var(--muted);
+  margin-top: 3px;
+  letter-spacing: 0.05em;
+}
+
+.toolbar-sep { width: 1px; background: var(--dim); margin: 0 4px; }
+.graph-toolbar { flex-wrap: wrap; right: 12px; }
+
+.legend-sep { height: 1px; background: var(--dim); margin: 6px 0; }
+.legend-line {
+  width: 18px;
+  height: 0;
+  border-top: 1.5px solid #555;
+}
+.legend-line.dashed { border-top: 1.5px dashed #444; }
+
+.link.follows { stroke: #3a3a3a; }
+.link.origen { stroke: #262626; stroke-dasharray: 3 3; }
+
+.hull path { cursor: pointer; transition: fill-opacity 0.2s, stroke-opacity 0.2s; }
+.hull text {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.15em;
+  text-anchor: middle;
+  pointer-events: none;
+  user-select: none;
+  paint-order: stroke;
+  stroke: var(--bg);
+  stroke-width: 3px;
+}
+.hull.dim { opacity: 0.12; }
+.hull.focus path { stroke-width: 2px; }
+
+.net-summary {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  margin-bottom: 8px;
+}
+.tier-text.tier-infiltrated { color: var(--accent); }
+.tier-text.tier-contact { color: var(--pink); }
+.tier-text.tier-cold { color: var(--muted); }
+
+.net-list {
+  max-height: 340px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.net-list::-webkit-scrollbar { width: 4px; }
+.net-list::-webkit-scrollbar-thumb { background: var(--dim); }
+
+.net-item {
+  border: 1px solid var(--dim);
+  border-left: 3px solid var(--muted);
+  padding: 8px 10px;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.net-item:hover { background: var(--bg-alt); }
+.net-item.tier-infiltrated { border-left-color: var(--accent); }
+.net-item.tier-contact { border-left-color: var(--pink); }
+.net-item.focus { border-color: var(--fg); box-shadow: 3px 3px 0 var(--accent); }
+
+.net-head { display: flex; justify-content: space-between; align-items: center; gap: 6px; }
+.net-name { font-weight: 500; word-break: break-all; }
+.net-meta { color: var(--muted); font-size: 10px; margin: 4px 0 6px; }
+
+.net-bar {
+  position: relative;
+  height: 12px;
+  background: var(--dim);
+}
+.net-bar-fill { height: 100%; background: var(--muted); }
+.tier-infiltrated .net-bar-fill { background: var(--accent); }
+.tier-contact .net-bar-fill { background: var(--pink); }
+.net-bar span {
+  position: absolute;
+  right: 4px;
+  top: 0;
+  font-size: 9px;
+  line-height: 12px;
+  color: var(--fg);
+  mix-blend-mode: difference;
+}
+.net-hubs { margin-top: 6px; }
+.net-hubs .neighbor-chip { margin-top: 0; }
+
+.tier-badge {
+  display: inline-block;
+  font-size: 8px;
+  letter-spacing: 0.15em;
+  padding: 1px 5px;
+  border: 1px solid var(--muted);
+  color: var(--muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.tier-badge.tier-infiltrated { border-color: var(--accent); color: var(--bg); background: var(--accent); }
+.tier-badge.tier-contact { border-color: var(--pink); color: var(--pink); }
