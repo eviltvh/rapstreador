@@ -1,34 +1,4 @@
-/* ═══════════════════════════════════════════════════════════
-   POLPO :: NETWORK ANALYZER  ·  dashboard.js
-   Toda la lógica de visualización (D3 + grafo + interacción).
-   No conoce Supabase: solo recibe rows transformados desde app.js
-   y dibuja. Entry point: buildDashboard(rows, extras).
-   -bynd
 
-   v3 · grafo tipo instagram
-   ─────────────────────────
-   Antes el grafo era un árbol origen → user → user (cada nodo
-   tenía UN solo padre: su origen de cacheo). Ahora hay dos tipos
-   de arista y un nodo puede tener varios "padres":
-
-     follows  A ──▶ B   A sigue a B. Sale de la tabla followed_by
-                        (el "Followed by A, C + 3 more" que lee el
-                        bot en el perfil de B). Varios usuarios
-                        convergen en uno, como en instagram.
-     origen   O ┄┄▶ U   U se cacheó desde la lista de O (linaje
-                        del bot). Se sigue usando para dead families.
-
-   Redes infiltradas
-   ─────────────────
-   Sobre el grafo completo (follows pesa más que origen) se corre
-   Louvain → comunidades. Para cada red con ≥ 3 nodos se mide:
-     index = (0.6·mutuals + 0.4·sigues) / tamaño        (0 … 1)
-   y se clasifica:
-     INFILTRATED  ≥ 2 mutuals  y  index ≥ 0.35
-     CONTACT      ≥ 1 mutual   o  index ≥ 0.20
-     COLD         lo demás
-   Cada red se dibuja como un casco (hull) detrás de sus nodos.
-   ═══════════════════════════════════════════════════════════ */
 
 "use strict";
 
@@ -42,6 +12,19 @@ const TIER = {
 const MIN_NET_SIZE = 3;                 // redes más chicas = nodos sueltos
 const EDGE_WEIGHT = { follows: 1.0, origen: 0.5 };
 const DEAD_STATUSES = new Set(['unfollowed', 'inactive', 'request_cancelled']);
+
+// ey fisica de constelaciones (SEPARACIÓN multiplica gap y repulsion) -bynd
+const CONST = {
+  bodyBase: 18,        // radio minimo de un cuerpo
+  bodyPerNode: 15,     // radio extra por √miembro
+  gap: 110,            // espacio libre entre bordes de dos redes grandes
+  cohesion: 0.12,      // jalon de cada nodo al centro de su cuerpo
+  collide: 0.9,        // que tan duro se separan cuerpos encimados
+  repulsion: 1600,     // empuje a distancia entre cuerpos (∝ √masas / d)
+  bridgeDist: 220,     // largo de aristas entre cuerpos distintos
+  bridgeStrength: 0.02,
+  separation: 1,       // slider
+};
 
 // Un nodo está VIVO si: status === 'active'  OR  mutual === true.
 // Una FAMILIA MUERTA es un sub-árbol (por aristas de ORIGEN) donde NINGÚN
@@ -69,6 +52,8 @@ const state = {
   deadSet: new Set(),
   nets: [],                // redes (≥ MIN_NET_SIZE), ordenadas por index
   netOf: new Map(),        // nodeId → net
+  groupOf: new Map(),      // nodeId → key de cuerpo (todas, incl. sueltos)
+  bodies: [],              // [{ key, ids, net }]
   focusNet: null,
   filter: 'all',
   selectedId: null,
@@ -386,7 +371,118 @@ function computeNetworks() {
 
   const netOf = new Map();
   nets.forEach(net => net.members.forEach(id => netOf.set(id, net)));
-  return { nets, netOf };
+
+  // aaa cuerpos para el layout: cada comunidad (incl. chicas y sueltos) es un cuerpo -bynd
+  const bodies = [];
+  const groupOf = new Map();
+  groups.forEach((members, c) => {
+    const net = netOf.get(members[0]) || null;
+    const key = net ? `n${net.id}` : `p${c}`;
+    bodies.push({ key, ids: members, net });
+    members.forEach(id => groupOf.set(id, key));
+  });
+  bodies.sort((a, b) => b.ids.length - a.ids.length);
+  return { nets, netOf, bodies, groupOf };
+}
+
+// ─── FUERZA DE CONSTELACIONES ────────────────────────────
+function bodyRadius(n) {
+  return CONST.bodyBase + CONST.bodyPerNode * Math.sqrt(n);
+}
+
+function forceConstellations() {
+  let bodies = [];
+
+  function force(alpha) {
+    const sep = CONST.separation;
+    // centroides
+    for (const b of bodies) {
+      let x = 0, y = 0;
+      for (const n of b.nodes) { x += n.x; y += n.y; }
+      b.cx = x / b.nodes.length;
+      b.cy = y / b.nodes.length;
+      b.vx = 0; b.vy = 0;
+    }
+
+    // cuerpo vs cuerpo: colision dura + repulsion suave a distancia
+    const gap = CONST.gap * sep;
+    for (let i = 0; i < bodies.length; i++) {
+      const A = bodies[i];
+      for (let j = i + 1; j < bodies.length; j++) {
+        const B = bodies[j];
+        let dx = B.cx - A.cx, dy = B.cy - A.cy;
+        let d2 = dx * dx + dy * dy;
+        if (d2 < 1e-6) { dx = (Math.random() - 0.5); dy = (Math.random() - 0.5); d2 = dx * dx + dy * dy; }
+        const d = Math.sqrt(d2);
+        const minD = A.r + B.r + gap * Math.max(0.15, Math.min(A.gapW, B.gapW));
+        let push = 0;
+        if (d < minD) push += (minD - d) * CONST.collide;
+        const reach = minD * 3;
+        if (d < reach) push += CONST.repulsion * sep * Math.sqrt(A.mass * B.mass) / (d + 30) * (1 - d / reach) * 0.05;
+        if (!push) continue;
+        const ux = dx / d, uy = dy / d;
+        const tot = A.mass + B.mass;
+        // el cuerpo chico se mueve mas que el grande
+        const fa = push * (B.mass / tot) * alpha, fb = push * (A.mass / tot) * alpha;
+        A.vx -= ux * fa; A.vy -= uy * fa;
+        B.vx += ux * fb; B.vy += uy * fb;
+      }
+    }
+
+    // aplicar: traslacion del cuerpo + cohesion de cada nodo
+    const k = CONST.cohesion * alpha;
+    for (const b of bodies) {
+      for (const n of b.nodes) {
+        n.vx += b.vx + (b.cx - n.x) * k;
+        n.vy += b.vy + (b.cy - n.y) * k;
+      }
+    }
+  }
+
+  force.initialize = (nodes) => {
+    const byKey = new Map();
+    nodes.forEach(n => {
+      const key = state.groupOf.get(n.id) || `s:${n.id}`;
+      if (!byKey.has(key)) byKey.set(key, []);
+      byKey.get(key).push(n);
+    });
+    bodies = Array.from(byKey.values()).map(ns => ({
+      nodes: ns,
+      mass: ns.length,
+      r: bodyRadius(ns.length),
+      cx: 0, cy: 0, vx: 0, vy: 0,
+      // ey cuerpos sueltos (sin red) piden poco espacio: no abren huecos entre constelaciones -bynd
+      gapW: Math.min(1, Math.sqrt(ns.length) / 4),
+    }));
+  };
+
+  return force;
+}
+
+// q chidoteee posicion inicial: centros en espiral (los grandes al centro) -bynd
+function seedPositions(width, height) {
+  const golden = Math.PI * (3 - Math.sqrt(5));
+  let ring = 0;
+  state.bodies.forEach((b, i) => {
+    const r = bodyRadius(b.ids.length);
+    ring += r + CONST.gap * CONST.separation * 0.6;
+    const dist = i === 0 ? 0 : Math.sqrt(ring) * 14;
+    const a = i * golden;
+    const cx = width / 2 + Math.cos(a) * dist;
+    const cy = height / 2 + Math.sin(a) * dist;
+    b.ids.forEach(id => {
+      const n = state.nodeMap.get(id);
+      if (!n || n.x != null) return;
+      const rr = r * Math.sqrt(Math.random()) * 0.8, aa = Math.random() * 2 * Math.PI;
+      n.x = cx + Math.cos(aa) * rr;
+      n.y = cy + Math.sin(aa) * rr;
+    });
+  });
+}
+
+function sameBody(l) {
+  const s = l.source.id || l.source, t = l.target.id || l.target;
+  return state.groupOf.get(s) === state.groupOf.get(t);
 }
 
 // ─── BFS SHORTEST PATH ───────────────────────────────────
@@ -526,17 +622,21 @@ function render() {
   styleGraph();
 
   if (simulation) simulation.stop();
+  seedPositions(width, height);
   simulation = d3.forceSimulation(state.nodes)
     .force('link', d3.forceLink(state.links).id(d => d.id)
-      .distance(d => d.kind === 'follows' ? 55 : 75)
-      .strength(d => d.kind === 'follows' ? 0.6 : 0.35))
-    .force('charge', d3.forceManyBody().strength(-170).distanceMax(600))
-    .force('center', d3.forceCenter(width / 2, height / 2))
-    .force('x', d3.forceX(width / 2).strength(0.02))
-    .force('y', d3.forceY(height / 2).strength(0.02))
-    .force('collide', d3.forceCollide().radius(d => nodeRadius(d) + 6))
+      // ey adentro del cuerpo: aristas cortas y firmes; puentes entre cuerpos: largos y flojos -bynd
+      .distance(d => sameBody(d) ? (d.kind === 'follows' ? 45 : 60) : CONST.bridgeDist * CONST.separation)
+      .strength(d => sameBody(d) ? (d.kind === 'follows' ? 0.5 : 0.3) : CONST.bridgeStrength))
+    // aaa la carga solo separa vecinos; el acomodo global lo hacen las constelaciones -bynd
+    .force('charge', d3.forceManyBody().strength(-90).distanceMax(160))
+    .force('constellations', forceConstellations())
+    // aaa las redes gravitan al centro; los sueltos casi no, asi quedan de halo afuera -bynd
+    .force('x', d3.forceX(width / 2).strength(d => state.netOf.has(d.id) ? 0.02 : 0.008))
+    .force('y', d3.forceY(height / 2).strength(d => state.netOf.has(d.id) ? 0.02 : 0.008))
+    .force('collide', d3.forceCollide().radius(d => nodeRadius(d) + 5).iterations(2))
     .alpha(1)
-    .alphaDecay(0.025);
+    .alphaDecay(0.02);
 
   let tick = 0;
   simulation.on('tick', () => {
@@ -1056,6 +1156,31 @@ function wireDashboardUI() {
   toggle('origenBtn', 'showOrigen', styleGraph);
   toggle('hullsBtn', 'showHulls', drawHulls);
 
+  // chintrolas slider SEPARACIÓN inyectado en la toolbar -bynd
+  const toolbar = document.querySelector('.graph-toolbar');
+  if (toolbar && !document.getElementById('sepRange')) {
+    const wrap = document.createElement('label');
+    wrap.id = 'sepWrap';
+    wrap.title = 'Separación entre constelaciones';
+    wrap.style.cssText = 'display:flex;align-items:center;gap:6px;background:var(--bg);border:1px solid var(--dim);' +
+      'padding:0 8px;font-family:var(--mono);font-size:10px;letter-spacing:0.15em;color:var(--fg);text-transform:uppercase;';
+    wrap.innerHTML = 'SEP <input type="range" id="sepRange" min="0.4" max="3" step="0.1" ' +
+      'style="width:90px;accent-color:#E8FF00;cursor:pointer;"><span id="sepVal" style="min-width:28px;color:var(--accent)"></span>';
+    toolbar.appendChild(wrap);
+  }
+  const sepRange = document.getElementById('sepRange');
+  if (sepRange) {
+    sepRange.value = CONST.separation;
+    document.getElementById('sepVal').textContent = `×${CONST.separation.toFixed(1)}`;
+    sepRange.oninput = () => {
+      CONST.separation = parseFloat(sepRange.value);
+      document.getElementById('sepVal').textContent = `×${CONST.separation.toFixed(1)}`;
+      const link = simulation?.force('link');
+      if (link) link.distance(link.distance());   // re-evalua distancias con la nueva separacion
+      if (!state.frozen) simulation?.alpha(0.5).restart();
+    };
+  }
+
   const colorBtn = document.getElementById('colorBtn');
   if (colorBtn) {
     const paint = () => {
@@ -1095,9 +1220,11 @@ function buildDashboard(rows, extras = {}) {
   const idx = indexGraph(nodes, links);
   Object.assign(state, idx);
   state.deadSet = computeDeadFamilies();
-  const { nets, netOf } = computeNetworks();
+  const { nets, netOf, bodies, groupOf } = computeNetworks();
   state.nets = nets;
   state.netOf = netOf;
+  state.bodies = bodies;
+  state.groupOf = groupOf;
   state.focusNet = null;
   state.selectedId = null;
   state.pathIds = new Set();
@@ -1121,6 +1248,7 @@ function destroyDashboard() {
     adj: new Map(), outAdj: new Map(), inAdj: new Map(),
     followOut: new Map(), followIn: new Map(), nodeMap: new Map(),
     deadSet: new Set(), nets: [], netOf: new Map(), focusNet: null,
+    groupOf: new Map(), bodies: [],
     selectedId: null, pathIds: new Set(), pathOrdered: [],
   });
   allNodesSel = allLinksSel = null;
