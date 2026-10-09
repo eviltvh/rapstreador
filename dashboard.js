@@ -1,4 +1,58 @@
+/* ═══════════════════════════════════════════════════════════
+   POLPO :: NETWORK ANALYZER  ·  dashboard.js
+   Toda la lógica de visualización (D3 + grafo + interacción).
+   No conoce Supabase: solo recibe rows transformados desde app.js
+   y dibuja. Entry point: buildDashboard(rows, extras).
+   -bynd
 
+   v3 · grafo tipo instagram
+   ─────────────────────────
+   Antes el grafo era un árbol origen → user → user (cada nodo
+   tenía UN solo padre: su origen de cacheo). Ahora hay dos tipos
+   de arista y un nodo puede tener varios "padres":
+
+     follows  A ──▶ B   A sigue a B. Sale de la tabla followed_by
+                        (el "Followed by A, C + 3 more" que lee el
+                        bot en el perfil de B). Varios usuarios
+                        convergen en uno, como en instagram.
+     origen   O ┄┄▶ U   U se cacheó desde la lista de O (linaje
+                        del bot). Se sigue usando para dead families.
+
+   Redes infiltradas
+   ─────────────────
+   Sobre el grafo completo (follows pesa más que origen) se corre
+   Louvain → comunidades. Para cada red con ≥ 3 nodos se mide:
+     index = (0.6·mutuals + 0.4·sigues) / tamaño        (0 … 1)
+   y se clasifica:
+     INFILTRATED  ≥ 2 mutuals  y  index ≥ 0.35
+     CONTACT      ≥ 1 mutual   o  index ≥ 0.20
+     COLD         lo demás
+   Cada red se dibuja como un casco (hull) detrás de sus nodos.
+
+   Constelaciones (layout)
+   ───────────────────────
+   Cada comunidad de Louvain es un CUERPO: un disco con radio
+   proporcional a √miembros. Una fuerza propia (forceConstellations)
+     · cohesión  → jala a cada nodo al centro de su cuerpo
+     · colisión  → dos cuerpos no se pueden encimar (radio + gap)
+     · repulsión → los cuerpos se empujan entre sí a distancia
+   Las aristas ENTRE cuerpos son largas y flojas para que un puente
+   no arrastre a dos constelaciones encima una de la otra. El slider
+   SEPARACIÓN de la toolbar escala gap y repulsión en vivo.
+
+   Puentes entre constelaciones
+   ────────────────────────────
+     · cuerpos conectados se ATRAEN (resorte ∝ log de # de aristas
+       entre ellos) → redes relacionadas quedan vecinas, las demás
+       se siguen repeliendo
+     · PUENTE   = nodo con alguna conexión afuera de su cuerpo →
+                  se acomoda en la orilla, del lado de sus vecinos
+                  externos
+     · SATÉLITE = nodo con tantas o más conexiones afuera que
+                  adentro → sale de su cuerpo y flota en el hueco
+                  hacia esos vecinos, dentro de un globito del
+                  color de su red
+   ═══════════════════════════════════════════════════════════ */
 
 "use strict";
 
@@ -23,6 +77,10 @@ const CONST = {
   repulsion: 1600,     // empuje a distancia entre cuerpos (∝ √masas / d)
   bridgeDist: 220,     // largo de aristas entre cuerpos distintos
   bridgeStrength: 0.02,
+  bodySpring: 0.07,    // atraccion entre cuerpos conectados
+  rimPull: 0.25,       // que tan fuerte se va un puente a la orilla
+  satPull: 0.18,       // jalon del satelite a su punto afuera del cuerpo
+  satOut: 0.55,        // que tan lejos sale el satelite (fraccion del gap)
   separation: 1,       // slider
 };
 
@@ -54,6 +112,7 @@ const state = {
   netOf: new Map(),        // nodeId → net
   groupOf: new Map(),      // nodeId → key de cuerpo (todas, incl. sueltos)
   bodies: [],              // [{ key, ids, net }]
+  roles: new Map(),        // nodeId → 'bridge' | 'satellite' (core no se guarda)
   focusNet: null,
   filter: 'all',
   selectedId: null,
@@ -390,17 +449,36 @@ function bodyRadius(n) {
   return CONST.bodyBase + CONST.bodyPerNode * Math.sqrt(n);
 }
 
+// ey roles por conexiones afuera vs adentro de su cuerpo -bynd
+function computeRoles() {
+  const roles = new Map();
+  state.nodes.forEach(n => {
+    const g = state.groupOf.get(n.id);
+    let ins = 0, outs = 0;
+    state.adj.get(n.id)?.forEach(m => { if (state.groupOf.get(m) === g) ins++; else outs++; });
+    if (!outs) return;
+    // satelite solo tiene sentido saliendo de una red (cuerpo con casco)
+    const inNet = state.netOf.has(n.id);
+    roles.set(n.id, inNet && outs >= ins ? 'satellite' : 'bridge');
+  });
+  return roles;
+}
+
 function forceConstellations() {
   let bodies = [];
+  let pairs = [];          // [A, B, k] cuerpos conectados con k aristas
+  let ext = [];            // [{ node, body, outs:[node], role }]
+  let linked = new Set();  // idxA*100000+idxB de cuerpos conectados
 
   function force(alpha) {
     const sep = CONST.separation;
-    // centroides
+    // centroides solo con el nucleo (los satelites no jalan el centro)
     for (const b of bodies) {
-      let x = 0, y = 0;
-      for (const n of b.nodes) { x += n.x; y += n.y; }
-      b.cx = x / b.nodes.length;
-      b.cy = y / b.nodes.length;
+      let x = 0, y = 0, c = 0;
+      for (const n of b.core) { x += n.x; y += n.y; c++; }
+      if (!c) for (const n of b.nodes) { x += n.x; y += n.y; c++; }
+      b.cx = x / c;
+      b.cy = y / c;
       b.vx = 0; b.vy = 0;
     }
 
@@ -418,64 +496,173 @@ function forceConstellations() {
         let push = 0;
         if (d < minD) push += (minD - d) * CONST.collide;
         const reach = minD * 3;
-        if (d < reach) push += CONST.repulsion * sep * Math.sqrt(A.mass * B.mass) / (d + 30) * (1 - d / reach) * 0.05;
+        // ey cuerpos conectados no se empujan a distancia, solo chocan -bynd
+        if (d < reach && !linked.has(A.idx * 100000 + B.idx)) push += CONST.repulsion * sep * Math.sqrt(A.mass * B.mass) / (d + 30) * (1 - d / reach) * 0.05;
         if (!push) continue;
         const ux = dx / d, uy = dy / d;
         const tot = A.mass + B.mass;
-        // el cuerpo chico se mueve mas que el grande
         const fa = push * (B.mass / tot) * alpha, fb = push * (A.mass / tot) * alpha;
         A.vx -= ux * fa; A.vy -= uy * fa;
         B.vx += ux * fb; B.vy += uy * fb;
       }
     }
 
-    // aplicar: traslacion del cuerpo + cohesion de cada nodo
+    // aaa resortes entre cuerpos conectados: quedan vecinos, no al otro lado del mapa -bynd
+    for (const [A, B, k] of pairs) {
+      const dx = B.cx - A.cx, dy = B.cy - A.cy;
+      const d = Math.sqrt(dx * dx + dy * dy) || 1;
+      const target = A.r + B.r + gap * Math.max(0.15, Math.min(A.gapW, B.gapW)) * 1.15;
+      if (d <= target) continue;
+      const pull = (d - target) * CONST.bodySpring * Math.min(1.5, Math.log1p(k) / 1.5) * alpha;
+      const ux = dx / d, uy = dy / d;
+      const tot = A.mass + B.mass;
+      A.vx += ux * pull * (B.mass / tot); A.vy += uy * pull * (B.mass / tot);
+      B.vx -= ux * pull * (A.mass / tot); B.vy -= uy * pull * (A.mass / tot);
+    }
+
+    // aplicar: traslacion del cuerpo + cohesion de cada nodo del nucleo
     const k = CONST.cohesion * alpha;
     for (const b of bodies) {
       for (const n of b.nodes) {
-        n.vx += b.vx + (b.cx - n.x) * k;
-        n.vy += b.vy + (b.cy - n.y) * k;
+        n.vx += b.vx;
+        n.vy += b.vy;
+        if (!n.__sat) {
+          n.vx += (b.cx - n.x) * k;
+          n.vy += (b.cy - n.y) * k;
+        }
+      }
+    }
+
+    // puentes a la orilla · satelites afuera, del lado de sus vecinos externos
+    for (const e of ext) {
+      let mx = 0, my = 0;
+      for (const o of e.outs) { mx += o.x; my += o.y; }
+      mx /= e.outs.length; my /= e.outs.length;
+      const b = e.body;
+      let dx = mx - b.cx, dy = my - b.cy;
+      const d = Math.sqrt(dx * dx + dy * dy) || 1;
+      dx /= d; dy /= d;
+      if (e.role === 'satellite') {
+        const out = Math.min(d * 0.6, b.r + gap * CONST.satOut);
+        const tx = b.cx + dx * out, ty = b.cy + dy * out;
+        e.node.vx += (tx - e.node.x) * CONST.satPull * alpha;
+        e.node.vy += (ty - e.node.y) * CONST.satPull * alpha;
+      } else {
+        const tx = b.cx + dx * b.r * 0.85, ty = b.cy + dy * b.r * 0.85;
+        const w = CONST.rimPull * e.share * alpha;
+        e.node.vx += (tx - e.node.x) * w;
+        e.node.vy += (ty - e.node.y) * w;
       }
     }
   }
 
   force.initialize = (nodes) => {
     const byKey = new Map();
+    const bodyOf = new Map();
     nodes.forEach(n => {
       const key = state.groupOf.get(n.id) || `s:${n.id}`;
       if (!byKey.has(key)) byKey.set(key, []);
       byKey.get(key).push(n);
+      n.__sat = state.roles.get(n.id) === 'satellite';
     });
-    bodies = Array.from(byKey.values()).map(ns => ({
-      nodes: ns,
-      mass: ns.length,
-      r: bodyRadius(ns.length),
-      cx: 0, cy: 0, vx: 0, vy: 0,
-      // ey cuerpos sueltos (sin red) piden poco espacio: no abren huecos entre constelaciones -bynd
-      gapW: Math.min(1, Math.sqrt(ns.length) / 4),
-    }));
+    bodies = Array.from(byKey.values()).map(ns => {
+      const b = {
+        nodes: ns,
+        core: ns.filter(n => !n.__sat),
+        mass: ns.length,
+        r: bodyRadius(ns.length),
+        cx: 0, cy: 0, vx: 0, vy: 0,
+        // ey cuerpos sueltos (sin red) piden poco espacio: no abren huecos entre constelaciones -bynd
+        gapW: Math.min(1, Math.sqrt(ns.length) / 4),
+      };
+      ns.forEach(n => bodyOf.set(n.id, b));
+      return b;
+    });
+    bodies.forEach((b, i) => { b.idx = i; });
+
+    // pares de cuerpos conectados
+    const pk = new Map();
+    state.links.forEach(l => {
+      const A = bodyOf.get(l.source.id || l.source), B = bodyOf.get(l.target.id || l.target);
+      if (!A || !B || A === B) return;
+      const [x, y] = bodies.indexOf(A) < bodies.indexOf(B) ? [A, B] : [B, A];
+      const key = bodies.indexOf(x) + '|' + bodies.indexOf(y);
+      if (!pk.has(key)) pk.set(key, [x, y, 0]);
+      pk.get(key)[2]++;
+    });
+    pairs = Array.from(pk.values());
+    linked = new Set(pairs.map(([x, y]) => Math.min(x.idx, y.idx) * 100000 + Math.max(x.idx, y.idx)));
+
+    // nodos con vecinos afuera
+    ext = [];
+    nodes.forEach(n => {
+      const role = state.roles.get(n.id);
+      if (!role) return;
+      const b = bodyOf.get(n.id);
+      const outs = [];
+      let ins = 0;
+      state.adj.get(n.id)?.forEach(m => {
+        const o = state.nodeMap.get(m);
+        if (bodyOf.get(m) === b) ins++; else if (o) outs.push(o);
+      });
+      if (outs.length) ext.push({ node: n, body: b, outs, role, share: outs.length / (outs.length + ins) });
+    });
   };
 
   return force;
 }
 
-// q chidoteee posicion inicial: centros en espiral (los grandes al centro) -bynd
+// q chidoteee posicion inicial: pre-acomodo de los CUERPOS segun sus conexiones -bynd
+// (sin esto, dos constelaciones conectadas pueden nacer en lados opuestos y ya no
+//  pueden cruzarse entre las demas para juntarse)
 function seedPositions(width, height) {
-  const golden = Math.PI * (3 - Math.sqrt(5));
-  let ring = 0;
-  state.bodies.forEach((b, i) => {
+  const sep = CONST.separation;
+  const idx = new Map();
+  const bnodes = state.bodies.map((b, i) => {
+    b.ids.forEach(id => idx.set(id, i));
     const r = bodyRadius(b.ids.length);
-    ring += r + CONST.gap * CONST.separation * 0.6;
-    const dist = i === 0 ? 0 : Math.sqrt(ring) * 14;
-    const a = i * golden;
-    const cx = width / 2 + Math.cos(a) * dist;
-    const cy = height / 2 + Math.sin(a) * dist;
+    return { i, r, n: b.ids.length, net: !!b.net, gapW: Math.min(1, Math.sqrt(b.ids.length) / 4) };
+  });
+  const pk = new Map();
+  state.links.forEach(l => {
+    const a = idx.get(l.source.id || l.source), c = idx.get(l.target.id || l.target);
+    if (a == null || c == null || a === c) return;
+    const key = Math.min(a, c) + '|' + Math.max(a, c);
+    if (!pk.has(key)) pk.set(key, { source: Math.min(a, c), target: Math.max(a, c), k: 0 });
+    pk.get(key).k++;
+  });
+  const blinks = Array.from(pk.values());
+  const gapOf = (A, B) => CONST.gap * sep * Math.max(0.15, Math.min(A.gapW, B.gapW));
+
+  // espiral como punto de partida (grandes al centro)
+  const golden = Math.PI * (3 - Math.sqrt(5));
+  let acc = 0;
+  bnodes.forEach((b, i) => {
+    acc += b.r + CONST.gap * sep * 0.6;
+    const dist = i === 0 ? 0 : Math.sqrt(acc) * 14;
+    b.x = width / 2 + Math.cos(i * golden) * dist;
+    b.y = height / 2 + Math.sin(i * golden) * dist;
+  });
+
+  const pre = d3.forceSimulation(bnodes)
+    .force('link', d3.forceLink(blinks).id(d => d.i)
+      .distance(l => l.source.r + l.target.r + gapOf(l.source, l.target) * 1.15)
+      .strength(l => Math.min(1, 0.25 + Math.log1p(l.k) / 3)))
+    .force('charge', d3.forceManyBody().strength(b => -30 * Math.sqrt(b.n) * sep))
+    .force('collide', d3.forceCollide().radius(b => b.r + CONST.gap * sep * b.gapW * 0.5).iterations(3))
+    .force('x', d3.forceX(width / 2).strength(b => b.net ? 0.06 : 0.02))
+    .force('y', d3.forceY(height / 2).strength(b => b.net ? 0.06 : 0.02))
+    .stop();
+  for (let t = 0; t < 400; t++) pre.tick();
+
+  state.bodies.forEach((b, i) => {
+    const c = bnodes[i];
     b.ids.forEach(id => {
       const n = state.nodeMap.get(id);
       if (!n || n.x != null) return;
-      const rr = r * Math.sqrt(Math.random()) * 0.8, aa = Math.random() * 2 * Math.PI;
-      n.x = cx + Math.cos(aa) * rr;
-      n.y = cy + Math.sin(aa) * rr;
+      const rr = c.r * Math.sqrt(Math.random()) * 0.8, aa = Math.random() * 2 * Math.PI;
+      n.x = c.x + Math.cos(aa) * rr;
+      n.y = c.y + Math.sin(aa) * rr;
     });
   });
 }
@@ -675,6 +862,7 @@ function hullPoints(net) {
   net.members.forEach(id => {
     const n = state.nodeMap.get(id);
     if (n.x == null) return;
+    if (state.roles.get(id) === 'satellite') return;   // ey el satelite tiene su propio globito -bynd
     const r = nodeRadius(n) + 14;
     pts.push([n.x - r, n.y], [n.x + r, n.y], [n.x, n.y - r], [n.x, n.y + r]);
   });
@@ -720,6 +908,24 @@ function drawHulls() {
       .attr('fill', c)
       .text(`${TIER[net.tier].label} · @${net.name} · ${Math.round(net.index * 100)}%`);
   });
+
+  // aaa globitos de satelites: mismo color que su red, punteados -bynd
+  const sats = state.showHulls
+    ? state.nodes.filter(n => state.roles.get(n.id) === 'satellite' && state.netOf.has(n.id) && n.x != null)
+    : [];
+  const ss = gHulls.selectAll('circle.sat-bubble').data(sats, d => d.id);
+  ss.exit().remove();
+  ss.enter().append('circle').attr('class', 'sat-bubble')
+    .merge(ss)
+    .attr('cx', d => d.x).attr('cy', d => d.y)
+    .attr('r', d => nodeRadius(d) + 12)
+    .attr('fill', d => TIER[state.netOf.get(d.id).tier].color)
+    .attr('fill-opacity', 0.08)
+    .attr('stroke', d => TIER[state.netOf.get(d.id).tier].color)
+    .attr('stroke-opacity', 0.7)
+    .attr('stroke-dasharray', '3,3')
+    .style('opacity', d => state.focusNet != null && state.netOf.get(d.id).id !== state.focusNet ? 0.12 : null)
+    .style('pointer-events', 'none');
 }
 
 // ─── HIGHLIGHTS ──────────────────────────────────────────
@@ -862,6 +1068,9 @@ function renderNodeInfo() {
 
   let html = `<div class="node-info-name">${d.id}</div><dl>`;
   if (state.deadSet.has(d.id)) html += `<dt>family</dt><dd style="color:${DEAD_COLOR};">dead branch</dd>`;
+  const role = state.roles.get(d.id);
+  if (role === 'satellite') html += `<dt>posición</dt><dd class="pink">satélite · más conexiones afuera que adentro</dd>`;
+  else if (role === 'bridge') html += `<dt>posición</dt><dd>puente · conecta con otra constelación</dd>`;
   if (net) {
     html += `<dt>red</dt><dd><span class="tier-badge tier-${net.tier}" data-net="${net.id}">${TIER[net.tier].label}</span> @${net.name}</dd>`;
     if (net.hubs.includes(d.id)) html += `<dt>rol</dt><dd class="accent">hub de su red</dd>`;
@@ -1225,6 +1434,7 @@ function buildDashboard(rows, extras = {}) {
   state.netOf = netOf;
   state.bodies = bodies;
   state.groupOf = groupOf;
+  state.roles = computeRoles();
   state.focusNet = null;
   state.selectedId = null;
   state.pathIds = new Set();
@@ -1248,7 +1458,7 @@ function destroyDashboard() {
     adj: new Map(), outAdj: new Map(), inAdj: new Map(),
     followOut: new Map(), followIn: new Map(), nodeMap: new Map(),
     deadSet: new Set(), nets: [], netOf: new Map(), focusNet: null,
-    groupOf: new Map(), bodies: [],
+    groupOf: new Map(), bodies: [], roles: new Map(),
     selectedId: null, pathIds: new Set(), pathOrdered: [],
   });
   allNodesSel = allLinksSel = null;
@@ -1262,4 +1472,4 @@ function showToast(msg) {
   setTimeout(() => el.classList.remove('show'), 4500);
 }
 
-window.POLPO_DASHBOARD = { buildDashboard, destroyDashboard, showToast, _louvain: louvain };
+window.POLPO_DASHBOARD = { buildDashboard, destroyDashboard, showToast, _louvain: louvain, _state: state };
